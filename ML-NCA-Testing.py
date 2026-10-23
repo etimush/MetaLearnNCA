@@ -33,7 +33,7 @@ HIDDEN_DIM = 256     # Hidden MLP channel dimension
 
 K_REPEATS = 5        # Evaluation repeats (k = 0, 1, 2, 3, 4, 5)
 N_STEPS = 19         # Base NCA steps per interaction
-SHIFTS_TO_PROG = 4   #Test time spatial shift to the program after generation
+SHIFTS_TO_PROG = 0   #Test time spatial shift to the program after generation
 
 CHECKPOINT_DIR = "checkpoints"
 RUN_SINGLE_SEED = 55         # e.g., 0, "0", or None
