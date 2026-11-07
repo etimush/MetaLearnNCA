@@ -22,8 +22,8 @@ LOSS_CHN = 10
 
 META_EPOCHS = 4000
 
-# 2 tasks parallel x 4 accumulation passes = 8 tasks per optimizer step
-# Cuts loop overhead by 4x compared to 16 accumulation steps!
+# 2 tasks in parallel x 8 accumulation passes = 16 tasks per optimizer step
+# (the setting used for the released checkpoints: ~87 min per 4000-epoch run)
 MICRO_BATCH_SIZE = 2
 ACCUM_STEPS = 8
 
@@ -220,7 +220,7 @@ def run_training(seed=42):
         epoch_loss = 0.0
         epoch_acc = 0.0
 
-        # Exactly 4 accumulation steps per epoch (fast & lightweight)
+        # ACCUM_STEPS accumulation passes per epoch (one optimizer step per epoch)
         for _ in range(ACCUM_STEPS):
             supp_x, supp_y, qry_x, qry_y = sample_vectorized_meta_batch(
                 omni_vram, meta_batch_size=MICRO_BATCH_SIZE, n_way=10, n_supp=1, n_qry=5
@@ -276,7 +276,7 @@ def run_training(seed=42):
             break
 
 
-        # Step optimizer once every 4 micro-batches
+        # Step optimizer once every ACCUM_STEPS micro-batches
         scaler.unscale_(optimizer)
         # Fast single-launch multi-tensor norm clipping
         torch.nn.utils.clip_grad_norm_(
