@@ -54,7 +54,27 @@ done
 
 read -r -a gpu_arr <<< "$GPUS"
 workers=$(( ${#gpu_arr[@]} * JOBS_PER_GPU ))
-echo "Launching ${#jobs[@]} training job(s) on $workers worker(s) [GPUs: $GPUS]"
+echo "Launching ${#jobs[@]} training job(s) on $workers worker(s) [GPUs: $GPUS]  (Ctrl-C stops everything)"
+
+# Background jobs of a script ignore Ctrl-C, so the workers would keep starting new runs.
+# Catch Ctrl-C / kill here and take down every worker and its training process.
+worker_pids=()
+kill_tree() {   # stop $1 first (so it cannot start another job), then its descendants
+  local kids
+  kids=$(pgrep -P "$1" 2>/dev/null)
+  kill -TERM "$1" 2>/dev/null
+  for k in $kids; do kill_tree "$k"; done
+}
+stop_all() {
+  trap - INT TERM
+  echo ""
+  echo "Stopping all ablation jobs... finished runs are kept; re-run the same command to resume"
+  echo "(interrupted runs continue from their last checkpoint, saved every 250 epochs)."
+  for p in "${worker_pids[@]}"; do kill_tree "$p"; done
+  wait 2>/dev/null
+  exit 130
+}
+trap stop_all INT TERM
 
 for w in $(seq 0 $((workers - 1))); do
   gpu=${gpu_arr[$(( w % ${#gpu_arr[@]} ))]}
@@ -77,6 +97,7 @@ for w in $(seq 0 $((workers - 1))); do
       fi
     done
   ) &
+  worker_pids+=($!)
 done
 wait
 echo "Training finished. Status per run:"
