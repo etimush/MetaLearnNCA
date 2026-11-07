@@ -1,3 +1,4 @@
+import csv
 import os
 import re
 import time
@@ -556,54 +557,108 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42,
                         help="Training seed, re-applied before each model so a model's result does not "
                              "depend on which models were trained before it.")
+    parser.add_argument("--seeds", nargs="+", type=int, default=None,
+                        help="Several training seeds (overrides --seed), e.g. --seeds 0 1 2 3 4")
+    parser.add_argument("--datasets", nargs="+", default=["omniglot", "mnist", "fashion", "kmnist", "usps", "medmnist"])
+    parser.add_argument("--results_dir", default="baseline_results",
+                        help="Per-task results are appended to <results_dir>/results_raw.csv and trained "
+                             "models saved to <results_dir>/checkpoints/. Combine seeds with "
+                             "ablations/make_table1.py.")
+    parser.add_argument("--no_skip", action="store_true",
+                        help="Retrain (model, seed) pairs whose results are already in results_raw.csv")
     args = parser.parse_args()
+    seeds = args.seeds if args.seeds else [args.seed]
 
-    set_determinism(args.seed)
     os.makedirs("./data", exist_ok=True)
+    os.makedirs(os.path.join(args.results_dir, "checkpoints"), exist_ok=True)
+    raw_path = os.path.join(args.results_dir, "results_raw.csv")
+    raw_fields = ["model", "train_seed", "dataset", "shot", "eval_seed", "acc", "time_s", "n_params",
+                  "epochs", "meta_batch", "matching_scale"]
 
+    def config_of(model_name):
+        return dict(epochs=str(args.epochs), meta_batch=str(args.meta_batch),
+                    matching_scale=str(args.matching_scale) if model_name == "MatchingNet" else "")
+
+    def already_done(model_name, seed):
+        if args.no_skip or not os.path.exists(raw_path):
+            return False
+        cfg = config_of(model_name)
+        need = {(d, str(k), str(args.eval_seed_start + r)) for d in args.datasets for k in args.shots
+                for r in range(args.test_runs)}
+        with open(raw_path) as f:
+            have = {(r["dataset"], r["shot"], r["eval_seed"]) for r in csv.DictReader(f)
+                    if r["model"] == model_name and r["train_seed"] == str(seed)
+                    and all(r[c] == v for c, v in cfg.items())}
+        return need <= have
+
+    set_determinism(seeds[0])
     print("Loading Omniglot Meta-Training Background Dataset...")
     omni_train_dataset = get_omniglot_train_dataset()
 
-    datasets = ["omniglot", "mnist", "fashion", "kmnist", "usps", "medmnist"]
+    datasets = args.datasets
+    new_file = not os.path.exists(raw_path)
+    raw_fh = open(raw_path, "a", newline="")
+    raw_writer = csv.DictWriter(raw_fh, fieldnames=raw_fields)
+    if new_file:
+        raw_writer.writeheader()
 
-    # Structure to hold results: results[dataset][shot][model] = (mean, ci)
-    results = {d: {s: {} for s in args.shots} for d in datasets}
+    for seed in seeds:
+        # Structure to hold results: results[dataset][shot][model] = (mean, ci) for this training seed
+        results = {d: {s: {} for s in args.shots} for d in datasets}
 
-    for model_name in args.models:
-        set_determinism(args.seed)
-        trained_model = train_model(
-            model_name, omni_train_dataset, meta_epochs=args.epochs, meta_batch_size=args.meta_batch,
-            matching_scale=args.matching_scale
-        )
-        trained_model.eval()
+        for model_name in args.models:
+            if already_done(model_name, seed):
+                print(f"[skip] {model_name} seed {seed}: results already in {raw_path} (use --no_skip)")
+                continue
+            set_determinism(seed)
+            trained_model = train_model(
+                model_name, omni_train_dataset, meta_epochs=args.epochs, meta_batch_size=args.meta_batch,
+                matching_scale=args.matching_scale
+            )
+            trained_model.eval()
+            n_params = sum(p.numel() for p in trained_model.parameters())
+            torch.save(trained_model.state_dict(),
+                       os.path.join(args.results_dir, "checkpoints", f"{model_name}_seed{seed}.pth"))
 
-        for k_shot in args.shots:
-            print(f"\nEvaluating {model_name} ({k_shot}-shot) over {args.test_runs} independent test runs...")
-            print("=" * 95)
-            print(
-                f"{'DATASET':<12} | {'SHOT':<6} | {'FINAL MEAN ACC ± 95% CI':<25} | {'AVG TIME (s)':<14} | {'BEST SEED':<10}")
-            print("=" * 95)
-
-            for d_name in datasets:
-                accs, wall_times = [], []
-                for run_idx in range(args.test_runs):
-                    acc, elap_t, _ = evaluate_global_dataset(
-                        trained_model, model_name, d_name, n_way=10, k_shot=k_shot,
-                        eval_seed=args.eval_seed_start + run_idx
-                    )
-                    accs.append(acc)
-                    wall_times.append(elap_t)
-
-                mean_acc, ci = compute_mean_and_95ci(accs)
-                avg_time = np.mean(wall_times)
-                best_acc = np.max(accs)
-
-                results[d_name][k_shot][model_name] = (mean_acc, ci)
-
+            for k_shot in args.shots:
+                print(f"\nEvaluating {model_name} seed {seed} ({k_shot}-shot) over {args.test_runs} independent test runs...")
+                print("=" * 95)
                 print(
-                    f"{d_name.upper():<12} | {k_shot:<6} | {mean_acc:6.2f}% ± {ci:4.2f}%             | {avg_time:10.2f}s   | {best_acc:6.2f}%")
+                    f"{'DATASET':<12} | {'SHOT':<6} | {'FINAL MEAN ACC ± 95% CI':<25} | {'AVG TIME (s)':<14} | {'BEST SEED':<10}")
+                print("=" * 95)
 
-            print("=" * 95)
+                for d_name in datasets:
+                    accs, wall_times = [], []
+                    for run_idx in range(args.test_runs):
+                        eval_seed = args.eval_seed_start + run_idx
+                        acc, elap_t, _ = evaluate_global_dataset(
+                            trained_model, model_name, d_name, n_way=10, k_shot=k_shot, eval_seed=eval_seed
+                        )
+                        accs.append(acc)
+                        wall_times.append(elap_t)
+                        raw_writer.writerow(dict(model=model_name, train_seed=seed, dataset=d_name, shot=k_shot,
+                                                 eval_seed=eval_seed, acc=f"{acc:.4f}", time_s=f"{elap_t:.4f}",
+                                                 n_params=n_params, **config_of(model_name)))
+                    raw_fh.flush()
 
-    # Print the aggregate summary tables at the very end
-    print_summary_tables(results, datasets, args.shots, args.models)
+                    mean_acc, ci = compute_mean_and_95ci(accs)
+                    avg_time = np.mean(wall_times)
+                    best_acc = np.max(accs)
+
+                    results[d_name][k_shot][model_name] = (mean_acc, ci)
+
+                    print(
+                        f"{d_name.upper():<12} | {k_shot:<6} | {mean_acc:6.2f}% ± {ci:4.2f}%             | {avg_time:10.2f}s   | {best_acc:6.2f}%")
+
+                print("=" * 95)
+
+        # Per-seed tables (CI over evaluation tasks only, i.e. ignoring training variance)
+        trained_now = [m for m in args.models if any(m in results[d][k] for d in datasets for k in args.shots)]
+        if trained_now:
+            print(f"\n##### Training seed {seed} #####")
+            print_summary_tables(results, datasets, args.shots, trained_now)
+    raw_fh.close()
+
+    print(f"\nPer-task results: {raw_path}")
+    print("Combine training seeds (mean ± SD) and add MetaLearnNCA with:\n"
+          f"  python ablations/make_table1.py --baseline_csv {raw_path} --nca_csv ablation_results/results_raw.csv")

@@ -137,8 +137,17 @@ python Train-Canonical-Models.py \
     --meta_batch 32 \
     --shots 1 5 10 \
     --test_runs 10 \
-    --models FOMAML ProtoNet MatchingNet RelationNet
+    --seeds 0 1 2 3 4 \
+    --models MAML ProtoNet MatchingNet RelationNet
 ```
+*Evaluation tasks are fixed by the evaluation seeds (43–52), identical to `ML-NCA-Testing.py`. Per-task results go to `baseline_results/results_raw.csv` (finished model/seed pairs are skipped on re-runs); trained models to `baseline_results/checkpoints/`.*
+
+### 4. Multi-seed Table 1 (baselines + MetaLearnNCA, mean ± SD over training seeds)
+
+```bash
+python ablations/make_table1.py --baseline_csv baseline_results/results_raw.csv --nca_csv ablation_results/results_raw.csv
+```
+*MetaLearnNCA rows come from `ablations/eval_ablation.py` (`full` = retrained, `full_original` = `checkpoints/`). Writes `table1/table1.md`, `table1.tex`, `table1_summary.csv`.*
 
 ---
 

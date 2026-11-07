@@ -12,6 +12,7 @@ of MetaLearnNCA; everything else is the training protocol of
 | `eval_ablation.py` | Evaluate every run on the Table-1 protocol and write the tables (Markdown, LaTeX, CSV) |
 | `eval_recurrence.py` | Test-time recurrence ablation and stability analysis on trained models (no retraining) |
 | `run_ablations.sh` | Train all variants × seeds (multi-GPU), then evaluate |
+| `make_table1.py` | Multi-seed Table 1: combines `baseline_results/results_raw.csv` (from `Train-Canonical-Models.py --seeds ...`) with the MetaLearnNCA rows of `ablation_results/results_raw.csv`; mean ± SD over training seeds, and a win/loss/n.s. call against the best baseline per row |
 
 ## Variants
 
@@ -74,7 +75,11 @@ VARIANTS="no_feedback noncellular_updater short_unroll" bash ablations/run_ablat
 # 3. Evaluate (resumable) + tables; add original checkpoints as an extra reference row
 python ablations/eval_ablation.py --runs_dir ablation_runs --original_ckpts checkpoints --original_seeds 0 1 6
 
-# 4. Test-time recurrence / stability (original checkpoints, no retraining)
+# 4. Multi-seed Table 1: baselines over 5 training seeds, then combine with the MetaLearnNCA rows of step 3
+python Train-Canonical-Models.py --seeds 0 1 2 3 4 --epochs 5000 --meta_batch 32 --shots 1 5 10 --test_runs 10
+python ablations/make_table1.py --baseline_csv baseline_results/results_raw.csv --nca_csv ablation_results/results_raw.csv
+
+# 5. Test-time recurrence / stability (original checkpoints, no retraining)
 python ablations/eval_recurrence.py --original_ckpts checkpoints --original_seeds 0 1 6 --shot 10
 ```
 
