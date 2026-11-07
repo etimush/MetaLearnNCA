@@ -45,16 +45,28 @@ Test-time recurrence (R3's "long recurrent unrolling") also needs no retraining:
 
 ### Deliberate differences from the original training script
 
-1. **Divergence is recorded, not hidden.** `ML-NCA-Faster-trainign.py` stops on
-   the first NaN loss and saves nothing. Here, steps with non-finite gradients
-   are skipped, a run is marked `diverged` only after 25 consecutive
-   non-finite epochs, and the status is written to `status.json`. The table
-   shows `ok/total` runs per variant.
-2. The logged loss is averaged over all accumulation passes.
-3. Runs can be resumed (`--resume`, checkpoint every 250 epochs).
-4. `grad_on_s` trains in bf16, or fp32 when bf16 is unavailable, because fp16
-   underflows in the inner gradient. It runs without `torch.compile`, which
-   does not support double backward.
+1. **bf16 instead of fp16** (on GPUs that support it, i.e. Ampere or newer). The NCA
+   state can grow beyond fp16's range (65,504); the resulting NaN losses made
+   the gradient scaler skip updates and, in the original script, ended runs at
+   the first NaN. bf16 has the range of fp32 at the same speed. A resumed run
+   keeps the precision it was started with. Report "bf16 mixed precision".
+2. **Guards against non-finite values, all recorded in `status.json`:**
+   * a pass with a non-finite loss is skipped (`skipped_passes`); the other
+     passes of that update still count;
+   * an update with non-finite gradients is skipped (`skipped_steps`);
+   * if 10 updates in a row are skipped, or the weights become non-finite, the
+     run rolls back to its last good state (kept in memory every 25 epochs) and
+     continues with a different, deterministic random stream (`rewinds`);
+   * after 10 roll-backs the run is marked `diverged`. The table shows
+     `ok/total` runs per variant.
+   The original script instead stopped at the first NaN loss and saved nothing.
+   Report the number of skipped passes, skipped updates and roll-backs per
+   variant (or state that there were none).
+3. The logged loss is averaged over all accumulation passes.
+4. Runs can be resumed (`--resume`, checkpoint every 250 epochs).
+5. `grad_on_s` runs without `torch.compile`, which does not support double
+   backward, and in fp32 on GPUs without bf16 (fp16 underflows in the inner
+   gradient).
 
 ## How to run
 

@@ -28,7 +28,9 @@ Examples
   python ablations/train_ablation.py --variant full --seed 0 --smoke --fake_data   # CPU check
 """
 import argparse
+import copy
 import csv
+import json
 import math
 import os
 import random
@@ -62,8 +64,9 @@ def parse_args():
     p.add_argument("--n_steps", type=int, default=None, help="override base N of the variant")
     p.add_argument("--k_repeats", type=int, default=None, help="override base K of the variant")
     p.add_argument("--amp", default="auto", choices=["auto", "fp16", "bf16", "none"],
-                   help="auto: fp16 on CUDA (as the original); grad_on_s uses bf16 if "
-                        "supported else fp32 (fp16 underflows in the inner gradient)")
+                   help="auto: bf16 on GPUs that support it (Ampere or newer), otherwise fp16 (fp32 for "
+                        "grad_on_s). The original script used fp16, whose range the NCA state can exceed "
+                        "(NaN losses); bf16 has the range of fp32 at the same speed.")
     p.add_argument("--compile", default="auto", choices=["auto", "on", "off"],
                    help="torch.compile the NCA update (auto: on for CUDA, off for second-order grad_on_s)")
     # variant options
@@ -78,8 +81,13 @@ def parse_args():
     # bookkeeping
     p.add_argument("--log_every", type=int, default=25)
     p.add_argument("--ckpt_every", type=int, default=250)
-    p.add_argument("--nan_patience", type=int, default=25,
-                   help="consecutive non-finite epochs before the run is marked diverged")
+    p.add_argument("--nan_patience", type=int, default=10,
+                   help="consecutive bad epochs (update skipped because of non-finite gradients) before "
+                        "rolling back to the last good snapshot")
+    p.add_argument("--snapshot_every", type=int, default=25,
+                   help="keep an in-memory copy of the last good training state every N epochs")
+    p.add_argument("--max_rewinds", type=int, default=10,
+                   help="roll-backs allowed before the run is marked diverged")
     p.add_argument("--resume", action="store_true", help="resume from latest.pt if present")
     p.add_argument("--overwrite", action="store_true", help="retrain even if status.json says ok")
     p.add_argument("--fake_data", action="store_true", help="synthetic strokes (no download)")
@@ -97,9 +105,9 @@ def resolve_amp(args, spec, device):
         return torch.float16
     if args.amp == "bf16":
         return torch.bfloat16
-    if spec.updater == "gradient":
-        return torch.bfloat16 if torch.cuda.is_bf16_supported() else None
-    return torch.float16
+    if torch.cuda.is_bf16_supported():
+        return torch.bfloat16       # fp32 range: the NCA state cannot overflow as it does in fp16
+    return None if spec.updater == "gradient" else torch.float16
 
 
 def main():
@@ -118,7 +126,6 @@ def main():
     os.makedirs(run_dir, exist_ok=True)
     status_path = os.path.join(run_dir, "status.json")
     if os.path.exists(status_path) and not args.overwrite:
-        import json
         st = json.load(open(status_path))
         if st.get("status") in ("ok", "diverged"):
             print(f"[skip] {run_dir} already finished with status '{st['status']}' (use --overwrite)")
@@ -134,6 +141,15 @@ def main():
     learner = L.build_learner(args.variant, opts).to(device)
     opts = learner.opts  # includes resolved defaults (e.g. inner_lr)
     amp_dtype = resolve_amp(args, spec, device)
+    cfg_path = os.path.join(run_dir, "config.json")
+    if args.resume and args.amp == "auto" and os.path.exists(cfg_path) \
+            and os.path.exists(os.path.join(run_dir, "latest.pt")):
+        # never switch precision in the middle of a run: keep the one it was started with
+        prev = json.load(open(cfg_path)).get("amp")
+        names = {"torch.float16": torch.float16, "torch.bfloat16": torch.bfloat16, "None": None}
+        if prev in names and names[prev] != amp_dtype:
+            print(f"[info] resuming with the run's original precision {prev} (current default: {amp_dtype})")
+            amp_dtype = names[prev]
 
     second_order = spec.updater == "gradient" and not opts["first_order"]
     use_compile = (args.compile == "on") or (args.compile == "auto" and device.type == "cuda" and not second_order)
@@ -173,9 +189,11 @@ def main():
     use_scaler = amp_dtype == torch.float16 and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
 
-    start_epoch, nonfinite_streak, skipped_steps = 1, 0, 0
+    start_epoch, skipped_steps, skipped_passes = 1, 0, 0
     latest_path = os.path.join(run_dir, "latest.pt")
     log_path = os.path.join(run_dir, "train_log.csv")
+    log_header = ["epoch", "loss", "acc", "lr", "grad_norm", "inner_lr_mean", "sec_per_epoch", "skipped_steps",
+                  "skipped_passes", "rewinds"]
     if args.resume and os.path.exists(latest_path):
         # Load on the CPU: RNG states must stay CPU ByteTensors (map_location=cuda would move them to the
         # GPU and set_rng_state rejects that); model/optimizer state is copied to the GPU by load_state_dict.
@@ -183,32 +201,46 @@ def main():
         learner.load_state_dict(ck["model"])
         optimizer.load_state_dict(ck["optimizer"])
         scheduler.load_state_dict(ck["scheduler"])
-        scaler.load_state_dict(ck["scaler"])
+        if use_scaler and ck.get("scaler"):
+            scaler.load_state_dict(ck["scaler"])
         start_epoch = ck["epoch"] + 1
         skipped_steps = ck.get("skipped_steps", 0)
+        skipped_passes = ck.get("skipped_passes", 0)
         random.setstate(ck["rng"]["python"]); np.random.set_state(ck["rng"]["numpy"])
         torch.set_rng_state(ck["rng"]["torch"].cpu())
         if device.type == "cuda" and ck["rng"].get("cuda") is not None:
             torch.cuda.set_rng_state(ck["rng"]["cuda"].cpu(), device)
         print(f"Resumed from epoch {ck['epoch']}")
+        with open(log_path) as f:                       # keep the column layout of an older log
+            log_header = next(csv.reader(f), log_header)
     else:
         with open(log_path, "w", newline="") as f:
-            csv.writer(f).writerow(["epoch", "loss", "acc", "lr", "grad_norm", "inner_lr_mean",
-                                    "sec_per_epoch", "skipped_steps"])
+            csv.writer(f).writerow(log_header)
 
     L.write_json(status_path, dict(status="running", epoch=start_epoch - 1))
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
 
+    def training_state():
+        return copy.deepcopy(dict(model=learner.state_dict(), optimizer=optimizer.state_dict(),
+                                  scheduler=scheduler.state_dict(), scaler=scaler.state_dict()))
+
+    def params_finite():
+        return bool(torch.stack([torch.isfinite(p).all() for p in params]).all())
+
     d = L.TRAIN_DEFAULTS
     t_start = time.time()
-    status, epoch = "ok", start_epoch - 1
-    oom_fallbacks = []
-    for epoch in range(start_epoch, epochs + 1):
+    status = "ok"
+    oom_fallbacks, rewinds = [], []
+    snapshot, snapshot_epoch = training_state(), start_epoch - 1   # always something to roll back to
+    bad_streak = 0
+    epoch = start_epoch
+    while epoch <= epochs:
         t_ep = time.time()
         while True:
             optimizer.zero_grad(set_to_none=True)
-            stats, oom = [], False   # (loss, acc) per pass, kept on the GPU: one sync per epoch
+            loss_sum = acc_sum = 0.0
+            good_passes, bad_passes, oom = 0, 0, False
             try:
                 for _ in range(accum):
                     supp_x, supp_y, qry_x, qry_y = L.sample_meta_batch(bank, micro, d["n_way"], d["n_supp"], d["n_qry"])
@@ -216,17 +248,23 @@ def main():
                     K = random.randint(k_base, k_base + 2)
                     with L.amp_context(device, amp_dtype):
                         loss, acc = learner.episode(supp_x, supp_y, qry_x, qry_y, micro, K, N)
+                    lv, av = torch.stack([loss.detach().float(), acc.detach().float()]).tolist()
+                    if not math.isfinite(lv):
+                        # skip this pass only: backpropagating a non-finite loss would poison the
+                        # gradient of the whole update
+                        bad_passes += 1
+                        continue
                     scaler.scale(loss / accum).backward()
-                    stats.append(torch.stack([loss.detach().float(), acc.detach().float()]))
+                    loss_sum += lv
+                    acc_sum += av
+                    good_passes += 1
             except torch.cuda.OutOfMemoryError:
                 oom = True
             if not oom:
-                loss_sum, acc_sum = torch.stack(stats).sum(0).tolist()
-                finite = math.isfinite(loss_sum)   # non-finite if any pass was
                 break
             # Out of GPU memory: halve the micro-batch and double the accumulation passes, so every
             # optimiser step still sees the same number of tasks, and redo this epoch.
-            loss = acc = stats = None
+            loss = acc = None
             optimizer.zero_grad(set_to_none=True)
             if device.type == "cuda":
                 torch.cuda.empty_cache()
@@ -239,47 +277,81 @@ def main():
             oom_fallbacks.append(dict(epoch=epoch, micro_batch=micro, accum=accum))
             print(f"[oom] {args.variant} seed {args.seed}: out of GPU memory at epoch {epoch}; retrying with "
                   f"--micro_batch {micro} --accum {accum} ({micro * accum} tasks per step)", flush=True)
+        skipped_passes += bad_passes
 
-        scaler.unscale_(optimizer)
-        gn = torch.nn.utils.clip_grad_norm_(params, max_norm=args.grad_clip)
-        if use_scaler:
-            scale_before = scaler.get_scale()
-            scaler.step(optimizer)          # skips internally on inf/nan grads
-            scaler.update()
-            if scaler.get_scale() < scale_before:
-                skipped_steps += 1
-        elif torch.isfinite(gn):
-            optimizer.step()
-        else:
+        stepped = False
+        gn = torch.tensor(float("nan"))
+        if good_passes > 0:
+            scaler.unscale_(optimizer)
+            gn = torch.nn.utils.clip_grad_norm_(params, max_norm=args.grad_clip)
+            if use_scaler:
+                scale_before = scaler.get_scale()
+                scaler.step(optimizer)          # skips internally on inf/nan grads
+                scaler.update()
+                stepped = scaler.get_scale() >= scale_before
+            elif torch.isfinite(gn):
+                optimizer.step()
+                stepped = True
+        if not stepped:
             skipped_steps += 1
         scheduler.step()
 
-        nonfinite_streak = 0 if finite else nonfinite_streak + 1
-        if nonfinite_streak >= args.nan_patience:
-            status = "diverged"
-            print(f"[diverged] {nonfinite_streak} consecutive non-finite epochs at epoch {epoch}")
-            break
+        # ---- guard: roll back to the last good state if updates keep failing or weights broke ----
+        weights_ok = params_finite()
+        bad_streak = 0 if stepped else bad_streak + 1
+        if bad_streak >= args.nan_patience or not weights_ok:
+            if len(rewinds) >= args.max_rewinds:
+                status = "diverged"
+                print(f"[diverged] {args.variant} seed {args.seed}: still failing after {len(rewinds)} "
+                      f"roll-backs (epoch {epoch})", flush=True)
+                break
+            learner.load_state_dict(snapshot["model"])
+            optimizer.load_state_dict(snapshot["optimizer"])
+            scheduler.load_state_dict(snapshot["scheduler"])
+            scaler.load_state_dict(snapshot["scaler"])
+            rewinds.append(dict(at_epoch=epoch, back_to_epoch=snapshot_epoch,
+                                reason="non-finite weights" if not weights_ok else f"{bad_streak} skipped updates"))
+            # a different (deterministic) random stream, so the same failing episodes are not replayed
+            reseed = args.seed * 1000 + len(rewinds)
+            random.seed(reseed); np.random.seed(reseed); torch.manual_seed(reseed)
+            print(f"[rewind] {args.variant} seed {args.seed}: {rewinds[-1]['reason']} at epoch {epoch}; "
+                  f"rolled back to epoch {snapshot_epoch} ({len(rewinds)}/{args.max_rewinds})", flush=True)
+            bad_streak = 0
+            epoch = snapshot_epoch + 1
+            continue
+
+        if stepped and epoch % args.snapshot_every == 0:
+            snapshot, snapshot_epoch = training_state(), epoch
 
         if epoch % args.log_every == 0 or epoch == 1:
             sec = time.time() - t_ep
             ilr = float(learner.inner_lr().detach().mean()) if hasattr(learner, "log_inner_lr") else float("nan")
-            row = [epoch, loss_sum / accum, 100.0 * acc_sum / accum, scheduler.get_last_lr()[0],
-                   float(gn), ilr, sec, skipped_steps]
+            n = max(1, good_passes)
+            values = dict(epoch=epoch, loss=loss_sum / n if good_passes else float("nan"),
+                          acc=100.0 * acc_sum / n if good_passes else float("nan"),
+                          lr=scheduler.get_last_lr()[0], grad_norm=float(gn), inner_lr_mean=ilr,
+                          sec_per_epoch=sec, skipped_steps=skipped_steps, skipped_passes=skipped_passes,
+                          rewinds=len(rewinds))
             with open(log_path, "a", newline="") as f:
-                csv.writer(f).writerow(row)
+                csv.writer(f).writerow([values.get(c, "") for c in log_header])
             eta = (epochs - epoch) * (time.time() - t_start) / max(1, epoch - start_epoch + 1) / 60
-            print(f"[{args.variant} s{args.seed}] ep {epoch:5d}/{epochs} | loss {row[1]:.4f} | "
-                  f"acc {row[2]:5.1f}% | gn {row[4]:.3f} | {sec:.2f}s/ep | ETA {eta:.0f} min", flush=True)
+            extra = f" | skipped passes {skipped_passes}" if skipped_passes else ""
+            extra += f" | rewinds {len(rewinds)}" if rewinds else ""
+            print(f"[{args.variant} s{args.seed}] ep {epoch:5d}/{epochs} | loss {values['loss']:.4f} | "
+                  f"acc {values['acc']:5.1f}% | gn {values['grad_norm']:.3f} | {sec:.2f}s/ep | "
+                  f"ETA {eta:.0f} min{extra}", flush=True)
 
-        if epoch % args.ckpt_every == 0:
+        if epoch % args.ckpt_every == 0 and stepped:
             torch.save(dict(model=learner.state_dict(), optimizer=optimizer.state_dict(),
                             scheduler=scheduler.state_dict(), scaler=scaler.state_dict(),
-                            epoch=epoch, skipped_steps=skipped_steps,
+                            epoch=epoch, skipped_steps=skipped_steps, skipped_passes=skipped_passes,
                             rng=dict(python=random.getstate(), numpy=np.random.get_state(),
                                      torch=torch.get_rng_state(),
                                      cuda=torch.cuda.get_rng_state(device) if device.type == "cuda" else None)),
                        latest_path)
             L.write_json(status_path, dict(status="running", epoch=epoch))
+        epoch += 1
+    epoch = min(epoch, epochs)
 
     wall = time.time() - t_start
     peak = torch.cuda.max_memory_allocated(device) / 2**20 if device.type == "cuda" else None
@@ -293,7 +365,8 @@ def main():
         torch.save({k: v.cpu() for k, v in learner.meta.state_dict().items()},
                    os.path.join(run_dir, "meta_nca.pth"))
     L.write_json(status_path, dict(status=status, epochs_completed=epoch, epochs_planned=epochs,
-                                   wall_time_s=wall, skipped_steps=skipped_steps,
+                                   wall_time_s=wall, skipped_steps=skipped_steps, skipped_passes=skipped_passes,
+                                   rewinds=rewinds, amp=str(amp_dtype),
                                    peak_train_mem_mb=peak, n_params=L.count_params(learner),
                                    micro_batch_final=micro, accum_final=accum, oom_fallbacks=oom_fallbacks))
     print(f"Finished {args.variant} seed {args.seed}: {status} after {epoch} epochs "
