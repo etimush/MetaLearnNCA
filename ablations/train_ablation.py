@@ -139,9 +139,10 @@ def main():
     use_compile = (args.compile == "on") or (args.compile == "auto" and device.type == "cuda" and not second_order)
     if use_compile:
         try:
-            learner.active.grid_update = torch.compile(learner.active.grid_update)
-            if getattr(learner, "meta", None) is not None:
-                learner.meta.grid_update = torch.compile(learner.meta.grid_update)
+            for nca in (learner.active, getattr(learner, "meta", None)):
+                if nca is not None:
+                    nca.grid_update = torch.compile(nca.grid_update)
+                    nca.dyn_update = torch.compile(nca.dyn_update)
         except Exception as e:  # pragma: no cover
             print(f"torch.compile skipped: {e}")
             use_compile = False

@@ -107,10 +107,10 @@ keeps 16 tasks per step; say which one you used in the paper).
 
 ## What has been verified (CPU, before any GPU run)
 
-* **Equivalence with the original code.** With the same seed, `full` loaded from
-  `checkpoints/*seed55.pth` produces bit-identical adapted programs and query
-  logits to the classes in `ML-NCA-Testing.py` (max abs. difference 0.0). The task
-  splits are identical to the original protocol for evaluation seeds 43, 47 and 52.
+* **Equivalence with the original code.** `full` loaded from `checkpoints/*seed55.pth`
+  matches the classes in `ML-NCA-Testing.py` with the same seed up to float32 rounding (max abs.
+  difference 2e-6 in the adapted program, 2e-5 in the logits; bit-identical before the speed-up
+  below). The task splits are identical for evaluation seeds 43, 47 and 52.
 * **Table-1 sanity check** (seed 55, 5-shot, 3 tasks, ≤40 test images/class):
   Omniglot 95.6% (Table 1: 95.20) and MNIST 83.5% (Table 1: 84.12).
 * **Every variant** trains, checkpoints, resumes and evaluates end to end
@@ -127,6 +127,20 @@ keeps 16 tasks per step; say which one you used in the paper).
 
 Not verified here: actual accuracies of the retrained variants. There is no GPU
 in this environment, and USPS, KMNIST and MedMNIST could not be downloaded.
+
+## Speed
+
+* Each NCA step computes W1 · P([static, state]); because the perception P is depthwise and W1 is
+  linear, the static part (image + program, or the error signal) is computed once per pass instead
+  of at every step (`BaseNCA.PRECOMPUTE_STATIC`). This is exact: losses identical and
+  meta-gradients equal to 1e-8 or better in float64 for every variant, and accuracies on the
+  released checkpoint unchanged. Measured on CPU: 2.1x faster for `full`, 1.8x for `grad_on_s`. Runs
+  started before this change resume normally (checkpoints are unchanged).
+* If `nvidia-smi` shows the GPU well below full utilisation, run several jobs per GPU
+  (`JOBS_PER_GPU=2` or `3`; a full-model run needs about 4 GB). This does not change training.
+* `EXTRA="--micro_batch 4 --accum 4"` (same 16 tasks per update, fewer, larger passes) is usually
+  faster on a GPU, but the step-length jitter is then drawn 4 instead of 8 times per update. That is
+  a small protocol change, so use it for all runs of the study or for none, and report it.
 
 ## Decide what each outcome means before you see the results
 

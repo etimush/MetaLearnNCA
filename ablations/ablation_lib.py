@@ -178,14 +178,49 @@ class BaseNCA(nn.Module):
         self.w2 = nn.Conv2d(hidden, c_out, 1, bias=False)
         self.w2.weight.data.mul_(w2_init_scale)
 
-    def perceive(self, x):
+    # Speed-up (exact up to float rounding): perception is depthwise and W1 is linear, so for an
+    # input [static, dyn] we have W1 P([static, dyn]) + b = (W1_s P(static) + b) + W1_d P(dyn).
+    # The static part (image + program for the Active-NCA, error signal for the Meta-NCA) does not
+    # change during a call, so it is computed once per call instead of at every step: the per-step
+    # 1x1 conv shrinks from 228 to 128 input channels (Active) / 168 to 128 (Meta), and fewer
+    # activations are stored for backward. Set PRECOMPUTE_STATIC = False for the literal form.
+    PRECOMPUTE_STATIC = True
+
+    def perceive(self, x, first_channel=0):
+        """Perception of input channels [first_channel, first_channel + x.shape[1])."""
         if self.perception == "identity":
             return x
+        c = x.shape[1]
+        f = self.filters[first_channel * self.n_filters:(first_channel + c) * self.n_filters]
         x_pad = F.pad(x, [1, 1, 1, 1], mode="circular")
-        return F.conv2d(x_pad, self.filters, groups=self.c_in)
+        return F.conv2d(x_pad, f, groups=c)
 
     def grid_update(self, x):
+        """Literal update rule (Eq. 1) on the full concatenated input."""
         return self.w2(F.relu(self.w1(self.perceive(x)), inplace=True))
+
+    def static_term(self, static):
+        n = static.shape[1] * self.n_filters
+        return F.conv2d(self.perceive(static, 0), self.w1.weight[:, :n], self.w1.bias)
+
+    def dyn_update(self, static_term, dyn, n_static: int):
+        n = n_static * self.n_filters
+        h = static_term + F.conv2d(self.perceive(dyn, n_static), self.w1.weight[:, n:])
+        return self.w2(F.relu(h, inplace=True))
+
+    def run(self, static, dyn, steps):
+        B, _, H, W = dyn.shape
+        if self.PRECOMPUTE_STATIC:
+            st = self.static_term(static.to(dyn.dtype))   # same promotion as torch.cat below
+            n_static = static.shape[1]
+            for _ in range(steps):
+                ds = self.dyn_update(st, dyn, n_static)
+                dyn = dyn + ds * _stochastic_mask(B, H, W, dyn.device)
+        else:
+            for _ in range(steps):
+                ds = self.grid_update(torch.cat([static, dyn], dim=1))
+                dyn = dyn + ds * _stochastic_mask(B, H, W, dyn.device)
+        return dyn
 
 
 def _stochastic_mask(B, H, W, device):
@@ -201,10 +236,7 @@ class ActiveNCA(BaseNCA):
         B, _, H, W = img.shape
         if dyn is None:
             dyn = torch.rand(B, ACTIVE_DYN_CHN, H, W, device=img.device)
-        for _ in range(steps):
-            ds = self.grid_update(torch.cat([img, program, dyn], dim=1))
-            dyn = dyn + ds * _stochastic_mask(B, H, W, img.device)
-        return dyn
+        return self.run(torch.cat([img, program], dim=1), dyn, steps)
 
 
 class MetaNCA(BaseNCA):
@@ -216,10 +248,7 @@ class MetaNCA(BaseNCA):
         B, _, H, W = signal.shape
         if dyn is None:
             dyn = torch.rand(B, META_DYN_CHN, H, W, device=signal.device)
-        for _ in range(steps):
-            ds = self.grid_update(torch.cat([signal, dyn], dim=1))
-            dyn = dyn + ds * _stochastic_mask(B, H, W, signal.device)
-        return dyn
+        return self.run(signal, dyn, steps)
 
 
 def matched_identity_hidden(hidden: int) -> int:
@@ -440,8 +469,8 @@ class NCAProtoNet(nn.Module):
         y = supp_y.view(n_tasks, -1)
         protos = torch.zeros(n_tasks, N_WAY, D, device=emb.device, dtype=emb.dtype)
         protos = protos.scatter_add(1, y[..., None].expand(-1, -1, D), emb)
-        counts = torch.zeros(n_tasks, N_WAY, device=emb.device).scatter_add(
-            1, y, torch.ones_like(y, dtype=torch.float))
+        counts = torch.zeros(n_tasks, N_WAY, device=emb.device, dtype=emb.dtype).scatter_add(
+            1, y, torch.ones_like(y, dtype=emb.dtype))
         return protos / counts.clamp(min=1.0)[..., None]
 
     def _neg_sqdist(self, q, p):
