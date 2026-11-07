@@ -140,7 +140,7 @@ python Train-Canonical-Models.py \
     --seeds 0 1 2 3 4 \
     --models MAML ProtoNet MatchingNet RelationNet
 ```
-*Evaluation tasks are fixed by the evaluation seeds (43–52), identical to `ML-NCA-Testing.py`. Per-task results go to `baseline_results/results_raw.csv` (finished model/seed pairs are skipped on re-runs); trained models to `baseline_results/checkpoints/`.*
+*Datasets are decoded once and cached as tensors in `./data/ablation_cache/` (training episodes are sampled on the GPU; FOMAML picks the faster of two equivalent implementations at start-up). Evaluation tasks are fixed by the evaluation seeds (43–52), identical to `ML-NCA-Testing.py`. Per-task results go to `baseline_results/results_raw.csv` (finished model/seed pairs are skipped on re-runs); trained models to `baseline_results/checkpoints/`.*
 
 ### 4. Multi-seed Table 1 (baselines + MetaLearnNCA, mean ± SD over training seeds)
 

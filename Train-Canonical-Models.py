@@ -1,19 +1,21 @@
 import csv
 import os
-import re
+import sys
 import time
 import argparse
 import random
 import numpy as np
-from PIL import ImageFilter
 from tqdm import tqdm
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchvision
-import torchvision.transforms as transforms
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader
+
+# Data loading, preprocessing and task splits are shared with the MetaLearnNCA evaluation
+# (ablations/ablation_lib.py), so both are scored on identical, identically preprocessed tasks.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "ablations"))
+import ablation_lib as AL  # noqa: E402
 
 # Optional Scipy for exact t-distribution critical values
 try:
@@ -189,150 +191,139 @@ def calculate_conv4_flops(batch_size):
 
 
 # ==========================================
-# 4. EXACT DATASETS & TRANSFORMS
+# 4. DATA: GPU-RESIDENT TENSORS (same preprocessing as before)
 # ==========================================
-def get_transforms():
-    standard_transform = transforms.Compose([
-        transforms.Resize((28, 28)),
-        transforms.ToTensor(),
-        transforms.Normalize((0.5,), (0.5,))
-    ])
+# Preprocessing (unchanged): resize to 28x28, ToTensor, normalise to [-1, 1]; Fashion-MNIST and
+# MedMNIST additionally use PIL FIND_EDGES; Omniglot is inverted. The transformed images are cached
+# once under ./data/ablation_cache/ instead of being decoded from PNG for every task.
 
-    fashion_transform = transforms.Compose([
-        transforms.Resize((28, 28)),
-        transforms.Lambda(lambda x: x.filter(ImageFilter.FIND_EDGES)),
-        transforms.ToTensor(),
-        transforms.Normalize((0.5,), (0.5,))
-    ])
-
-    omniglot_transform = transforms.Compose([
-        transforms.Resize((28, 28)),
-        transforms.ToTensor(),
-        transforms.Lambda(lambda x: 1.0 - x),
-        transforms.Normalize((0.5,), (0.5,))
-    ])
-
-    return standard_transform, fashion_transform, omniglot_transform
+def get_omniglot_train_bank():
+    """Omniglot background set as a (964 classes, 20 drawers, 1, 28, 28) tensor on DEVICE."""
+    return AL.load_omniglot_train_bank("./data").to(DEVICE)
 
 
-def get_omniglot_train_dataset():
-    _, _, omniglot_transform = get_transforms()
-    dataset = torchvision.datasets.Omniglot('./data', background=True, download=True, transform=omniglot_transform)
-    dataset.targets = torch.tensor([target for _, target in dataset._flat_character_images])
-    return dataset
+@torch.no_grad()
+def sample_train_tasks(bank, n_tasks, n_way=10, n_support=1, n_query=5):
+    """Sample n_tasks episodes at once on DEVICE. Same distribution as the previous per-task
+    sampler: n_way distinct classes, n_support + n_query distinct examples per class, uniformly;
+    labels 0..n_way-1 in class order. Returns (T, n_way*n_support, ...) / (T, n_way*n_query, ...)."""
+    n_cls, n_ex, C, H, W = bank.shape
+    cls = torch.rand(n_tasks, n_cls, device=bank.device).argsort(dim=1)[:, :n_way]
+    ex = torch.rand(n_tasks, n_way, n_ex, device=bank.device).argsort(dim=2)[:, :, :n_support + n_query]
+    imgs = bank[cls.unsqueeze(-1), ex]                     # (T, n_way, n_support + n_query, C, H, W)
+    supp_x = imgs[:, :, :n_support].reshape(n_tasks, n_way * n_support, C, H, W)
+    qry_x = imgs[:, :, n_support:].reshape(n_tasks, n_way * n_query, C, H, W)
+    labels = torch.arange(n_way, device=bank.device)
+    supp_y = labels.repeat_interleave(n_support).repeat(n_tasks, 1)
+    qry_y = labels.repeat_interleave(n_query).repeat(n_tasks, 1)
+    return supp_x, supp_y, qry_x, qry_y
 
 
-def sample_train_task(dataset, n_way=10, n_support=1, n_query=5):
-    targets = dataset.targets.numpy()
-    available_classes = list(np.unique(targets))
-    np.random.shuffle(available_classes)
-    chosen_classes = available_classes[:n_way]
-    class_to_surrogate = {true_cls: surr for surr, true_cls in enumerate(chosen_classes)}
+_EVAL_DATA = {}
 
-    support_idx, query_idx = [], []
-    for true_cls in chosen_classes:
-        pos = np.where(targets == true_cls)[0]
-        chosen = np.random.choice(pos, n_support + n_query, replace=False)
-        support_idx.extend(chosen[:n_support])
-        query_idx.extend(chosen[n_support:])
 
-    supp_set = Subset(dataset, support_idx)
-    qry_set = Subset(dataset, query_idx)
-
-    supp_loader = DataLoader(supp_set, batch_size=len(supp_set), shuffle=False)
-    qry_loader = DataLoader(qry_set, batch_size=len(qry_set), shuffle=False)
-
-    supp_x, supp_y_orig = next(iter(supp_loader))
-    qry_x, qry_y_orig = next(iter(qry_loader))
-
-    supp_y = torch.zeros_like(supp_y_orig)
-    qry_y = torch.zeros_like(qry_y_orig)
-
-    for true_cls, surr in class_to_surrogate.items():
-        supp_y[supp_y_orig == true_cls] = surr
-        qry_y[qry_y_orig == true_cls] = surr
-
-    return supp_x.to(DEVICE), supp_y.to(DEVICE), qry_x.to(DEVICE), qry_y.to(DEVICE)
+def get_eval_data(dataset_name):
+    """(images on DEVICE, targets) for an evaluation dataset; loaded and cached once per process."""
+    if dataset_name not in _EVAL_DATA:
+        images, targets = AL.load_eval_dataset(dataset_name, "./data")
+        _EVAL_DATA[dataset_name] = (images.to(DEVICE), targets)
+    return _EVAL_DATA[dataset_name]
 
 
 def get_global_splits(dataset_name, n_way=10, k_shot=10, eval_seed=42):
-    standard_transform, fashion_transform, omniglot_transform = get_transforms()
+    """One evaluation task: k_shot support images for each of n_way classes, ALL other images of
+    those classes as test set. The task depends only on eval_seed and is the one used by
+    ML-NCA-Testing.py and ablations/eval_ablation.py (AL.make_task_split).
 
-    if dataset_name == "mnist":
-        dataset = torchvision.datasets.MNIST('./data', train=False, download=True, transform=standard_transform)
-        targets = dataset.targets.numpy()
-    elif dataset_name == "fashion":
-        dataset = torchvision.datasets.FashionMNIST('./data', train=False, download=True, transform=fashion_transform)
-        targets = dataset.targets.numpy()
-    elif dataset_name == "kmnist":
-        dataset = torchvision.datasets.KMNIST('./data', train=False, download=True, transform=standard_transform)
-        targets = dataset.targets.numpy()
-    elif dataset_name == "usps":
-        dataset = torchvision.datasets.USPS('./data', train=False, download=True, transform=standard_transform)
-        targets = np.array(dataset.targets)
-    elif dataset_name == "medmnist":
-        import medmnist
-        info = medmnist.INFO['organamnist']
-        DataClass = getattr(medmnist, info['python_class'])
-        dataset = DataClass(split='test', download=True, transform=fashion_transform)
-        targets = dataset.labels.flatten()
-    elif dataset_name == "omniglot":
-        dataset = torchvision.datasets.Omniglot('./data', background=False, download=True, transform=omniglot_transform)
-        targets = np.array([y for _, y in dataset])
-    else:
-        raise ValueError(f"Unknown dataset: {dataset_name}")
-
-    # The task (which classes, which support images) is a function of eval_seed only.
-    # A private RandomState(eval_seed) draws exactly what np.random.seed(eval_seed) +
-    # np.random.shuffle draw in ML-NCA-Testing.py, so for the same eval_seed the
-    # baselines are scored on the same tasks as MetaLearnNCA (Table 1), independently
-    # of how much global RNG the preceding meta-training consumed.
-    rng = np.random.RandomState(eval_seed)
-    support_idx, test_idx = [], []
-    available_classes = sorted(set(np.asarray(targets).tolist()))
-    rng.shuffle(available_classes)
-    chosen_classes = available_classes[:n_way]
-    class_to_surrogate = {true_cls: surr for surr, true_cls in enumerate(chosen_classes)}
-
-    for true_cls in chosen_classes:
-        pos = np.where(targets == true_cls)[0]
-        rng.shuffle(pos)
-        support_idx.extend(pos[:k_shot])
-        test_idx.extend(pos[k_shot:])
-
-    class RemappedSubset(torch.utils.data.Dataset):
-        def __init__(self, ds, indices, class_map):
-            self.ds = ds
-            self.indices = indices
-            self.class_map = class_map
-
-        def __len__(self):
-            return len(self.indices)
-
-        def __getitem__(self, idx):
-            img, true_label = self.ds[self.indices[idx]]
-            if isinstance(true_label, (np.ndarray, list)):
-                true_label = int(true_label[0])
-            elif torch.is_tensor(true_label):
-                true_label = int(true_label.item())
-            return img, self.class_map[true_label]
-
-    supp_set = RemappedSubset(dataset, support_idx, class_to_surrogate)
-    test_set = RemappedSubset(dataset, test_idx, class_to_surrogate)
-
-    supp_loader = DataLoader(supp_set, batch_size=len(supp_set), shuffle=False)
-
+    Returns ((supp_x, supp_y), test_batches). The test batches (128 images) come in exactly the
+    order of the previous DataLoader(shuffle=True, generator seeded with eval_seed). This matters
+    for MAML, whose BatchNorm normalises with the statistics of each test batch."""
+    images, targets = get_eval_data(dataset_name)
+    split = AL.make_task_split(targets, n_way, k_shot, eval_seed)
+    supp_x = images[torch.as_tensor(split.supp_idx, device=images.device)]
+    supp_y = torch.as_tensor(split.supp_y, device=DEVICE)
+    test_idx = torch.as_tensor(split.test_idx, device=images.device)
+    test_y = torch.as_tensor(split.test_y, device=DEVICE)
     gen = torch.Generator()
     gen.manual_seed(eval_seed)
-    test_loader = DataLoader(test_set, batch_size=128, shuffle=True, generator=gen)
-
-    return supp_loader, test_loader
+    order = DataLoader(range(len(split.test_idx)), batch_size=128, shuffle=True, generator=gen)
+    test_batches = [(images[test_idx[b.to(images.device)]], test_y[b.to(DEVICE)]) for b in order]
+    return (supp_x, supp_y), test_batches
 
 
 # ==========================================
 # 5. TRAINING ROUTINE
 # ==========================================
-def train_model(model_name, omni_dataset, meta_epochs=1500, meta_batch_size=32, matching_scale=100.0):
+def maml_meta_loss(model, supp_x, supp_y, qry_x, qry_y, inner_steps=3, inner_lr=0.1, grad_clip=1.0):
+    """First-order MAML query loss averaged over a batch of tasks, all tasks in one vmapped call.
+
+    Identical to looping MAMLNet.adapt (create_graph=False) + query loss over the tasks and summing
+    loss / n_tasks: inner gradients are detached (first order) and clipped element-wise, and MAMLNet's
+    BatchNorm keeps no running statistics, so each task is normalised with its own batch statistics
+    under vmap exactly as in the sequential version.
+    Shapes: supp_x (T, S, C, H, W), supp_y (T, S), qry_x (T, Q, C, H, W), qry_y (T, Q)."""
+    params = dict(model.named_parameters())
+    buffers = dict(model.named_buffers())
+
+    def inner_loss(p, x, y):
+        return F.cross_entropy(torch.func.functional_call(model, (p, buffers), (x,)), y)
+
+    def task_loss(p, xs, ys, xq, yq):
+        for _ in range(inner_steps):
+            g = torch.func.grad(inner_loss)(p, xs, ys)
+            if grad_clip is not None and grad_clip > 0:
+                g = {k: torch.clamp(v, -grad_clip, grad_clip) for k, v in g.items()}
+            p = {k: p[k] - inner_lr * g[k].detach() for k in p}
+        return F.cross_entropy(torch.func.functional_call(model, (p, buffers), (xq,)), yq)
+
+    losses = torch.func.vmap(task_loss, in_dims=(None, 0, 0, 0, 0))(params, supp_x, supp_y, qry_x, qry_y)
+    return losses.mean()
+
+
+def task_loss_sequential(model, model_name, supp_x, supp_y, qry_x, qry_y):
+    """Loss of one episode (the original per-task code)."""
+    if model_name in ["ProtoNet", "MatchingNet"]:
+        return F.cross_entropy(model(supp_x, supp_y, qry_x, 10), qry_y)
+    if model_name == "RelationNet":
+        return F.mse_loss(model(supp_x, supp_y, qry_x, 10), F.one_hot(qry_y, num_classes=10).float())
+    fast_weights = model.adapt(supp_x, supp_y, inner_steps=3, inner_lr=0.1, grad_clip=1.0, create_graph=False)
+    return F.cross_entropy(torch.func.functional_call(model, fast_weights, qry_x), qry_y)
+
+
+def _sync():
+    if DEVICE.type == "cuda":
+        torch.cuda.synchronize()
+
+
+def choose_maml_mode(model, omni_bank, meta_batch_size, trials=3):
+    """Time the vmapped and the per-task FOMAML step on this machine and return the faster one.
+    Both compute the same meta-gradient (checked to 1e-15 in float64), so this only affects speed.
+    Uses one fixed batch of tasks, so the training RNG stream does not depend on the outcome."""
+    batch = sample_train_tasks(omni_bank, meta_batch_size, n_way=10, n_support=1, n_query=5)
+    timings = {}
+    for mode in ("vmap", "loop"):
+        try:
+            for i in range(trials + 1):                    # first call = warm-up
+                if i == 1:
+                    _sync(); t0 = time.perf_counter()
+                model.zero_grad()
+                if mode == "vmap":
+                    maml_meta_loss(model, *batch).backward()
+                else:
+                    for t in range(meta_batch_size):
+                        (task_loss_sequential(model, "MAML", *(b[t] for b in batch)) / meta_batch_size).backward()
+            _sync(); timings[mode] = (time.perf_counter() - t0) / trials
+        except Exception as e:  # e.g. an older torch without the needed vmap batching rules
+            print(f"[info] {mode} MAML unavailable ({type(e).__name__}: {e})")
+    model.zero_grad()
+    best = min(timings, key=timings.get)
+    print("[info] FOMAML step time: " + ", ".join(f"{k} {v * 1000:.0f} ms" for k, v in timings.items()) +
+          f" -> using {best}")
+    return best
+
+
+def train_model(model_name, omni_bank, meta_epochs=1500, meta_batch_size=32, matching_scale=100.0,
+                maml_mode="auto"):
     print(f"\n=======================================================")
     print(f" TRAINING BASELINE: {model_name} (Meta-Batch Size: {meta_batch_size})")
     print(f"=======================================================")
@@ -345,33 +336,41 @@ def train_model(model_name, omni_dataset, meta_epochs=1500, meta_batch_size=32, 
         model = RelationNet().to(DEVICE)
     elif model_name == "MAML":
         model = MAMLNet(n_way=10).to(DEVICE)
+    else:
+        raise ValueError(f"Unknown model '{model_name}' (choose from ProtoNet MatchingNet RelationNet MAML)")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5)
     model.train()
+    use_vmap = False
+    if model_name == "MAML":
+        if maml_mode == "auto":
+            maml_mode = choose_maml_mode(model, omni_bank, meta_batch_size)
+        use_vmap = maml_mode == "vmap"
 
     pbar = tqdm(range(1, meta_epochs + 1), desc=f"Training {model_name}")
     for epoch in pbar:
         optimizer.zero_grad()
-        epoch_loss = 0.0
-
-        for task_idx in range(meta_batch_size):
-            supp_x, supp_y, qry_x, qry_y = sample_train_task(omni_dataset, n_way=10, n_support=1, n_query=5)
-
-            if model_name in ["ProtoNet", "MatchingNet"]:
-                logits = model(supp_x, supp_y, qry_x, 10)
-                loss = F.cross_entropy(logits, qry_y) / meta_batch_size
-            elif model_name == "RelationNet":
-                scores = model(supp_x, supp_y, qry_x, 10)
-                y_qry_onehot = F.one_hot(qry_y, num_classes=10).float()
-                loss = F.mse_loss(scores, y_qry_onehot) / meta_batch_size
-            elif model_name == "MAML":
-                fast_weights = model.adapt(supp_x, supp_y, inner_steps=3, inner_lr=0.1, grad_clip=1.0,
-                                           create_graph=False)
-                qry_logits = torch.func.functional_call(model, fast_weights, qry_x)
-                loss = F.cross_entropy(qry_logits, qry_y) / meta_batch_size
-
-            loss.backward()
-            epoch_loss += loss.item() * meta_batch_size
+        supp_xs, supp_ys, qry_xs, qry_ys = sample_train_tasks(omni_bank, meta_batch_size, n_way=10,
+                                                              n_support=1, n_query=5)
+        epoch_loss = None
+        if use_vmap:
+            try:
+                loss = maml_meta_loss(model, supp_xs, supp_ys, qry_xs, qry_ys,
+                                      inner_steps=3, inner_lr=0.1, grad_clip=1.0)
+                loss.backward()
+                epoch_loss = loss.item() * meta_batch_size
+            except Exception as e:  # e.g. an older torch without the needed vmap batching rules
+                print(f"[warn] batched MAML failed ({type(e).__name__}: {e}); using the per-task loop")
+                use_vmap = False
+                optimizer.zero_grad()
+        if epoch_loss is None:
+            # ProtoNet / MatchingNet / RelationNet keep one forward per task: their BatchNorm updates
+            # running statistics on every call, so batching tasks would change training.
+            epoch_loss = 0.0
+            for t in range(meta_batch_size):
+                loss = task_loss_sequential(model, model_name, supp_xs[t], supp_ys[t], qry_xs[t], qry_ys[t])
+                (loss / meta_batch_size).backward()
+                epoch_loss += loss.item()
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
@@ -386,9 +385,8 @@ def train_model(model_name, omni_dataset, meta_epochs=1500, meta_batch_size=32, 
 # 6. GLOBAL EVALUATION (EXHAUSTIVE TEST SET)
 # ==========================================
 def evaluate_global_dataset(model, model_name, dataset_name, n_way=10, k_shot=10, eval_seed=42):
-    supp_loader, test_loader = get_global_splits(dataset_name, n_way=n_way, k_shot=k_shot, eval_seed=eval_seed)
-    supp_x, supp_y = next(iter(supp_loader))
-    supp_x, supp_y = supp_x.to(DEVICE), supp_y.to(DEVICE)
+    (supp_x, supp_y), test_batches = get_global_splits(dataset_name, n_way=n_way, k_shot=k_shot,
+                                                       eval_seed=eval_seed)
     B_supp = supp_x.size(0)
 
     total_flops = 0.0
@@ -430,8 +428,7 @@ def evaluate_global_dataset(model, model_name, dataset_name, n_way=10, k_shot=10
     total = 0
 
     with torch.no_grad():
-        for qry_x, qry_y in test_loader:
-            qry_x, qry_y = qry_x.to(DEVICE), qry_y.to(DEVICE)
+        for qry_x, qry_y in test_batches:
             B_qry = qry_x.size(0)
             total_flops += calculate_conv4_flops(B_qry)
 
@@ -564,6 +561,9 @@ if __name__ == "__main__":
                         help="Per-task results are appended to <results_dir>/results_raw.csv and trained "
                              "models saved to <results_dir>/checkpoints/. Combine seeds with "
                              "ablations/make_table1.py.")
+    parser.add_argument("--maml_mode", choices=["auto", "vmap", "loop"], default="auto",
+                        help="FOMAML training: all tasks in one vmapped call, or the per-task loop. Same "
+                             "meta-gradient; 'auto' times both at start-up and uses the faster one.")
     parser.add_argument("--no_skip", action="store_true",
                         help="Retrain (model, seed) pairs whose results are already in results_raw.csv")
     args = parser.parse_args()
@@ -593,7 +593,7 @@ if __name__ == "__main__":
 
     set_determinism(seeds[0])
     print("Loading Omniglot Meta-Training Background Dataset...")
-    omni_train_dataset = get_omniglot_train_dataset()
+    omni_train_bank = get_omniglot_train_bank()
 
     datasets = args.datasets
     new_file = not os.path.exists(raw_path)
@@ -612,8 +612,8 @@ if __name__ == "__main__":
                 continue
             set_determinism(seed)
             trained_model = train_model(
-                model_name, omni_train_dataset, meta_epochs=args.epochs, meta_batch_size=args.meta_batch,
-                matching_scale=args.matching_scale
+                model_name, omni_train_bank, meta_epochs=args.epochs, meta_batch_size=args.meta_batch,
+                matching_scale=args.matching_scale, maml_mode=args.maml_mode
             )
             trained_model.eval()
             n_params = sum(p.numel() for p in trained_model.parameters())
