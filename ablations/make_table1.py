@@ -43,7 +43,8 @@ TEST_TIME_GRADS = {"MatchingNet": "No", "RelationNet": "No", "ProtoNet": "No",
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--baseline_csv", default="baseline_results/results_raw.csv")
+    p.add_argument("--baseline_csv", nargs="+", default=["baseline_results/results_raw.csv"],
+                   help="one or more results_raw.csv files (e.g. one per parallel baseline process)")
     p.add_argument("--nca_csv", default="ablation_results/results_raw.csv")
     p.add_argument("--nca_models", nargs="+", default=["full", "full_original"],
                    help="model names from the eval_ablation CSV to show as MetaLearnNCA columns; "
@@ -58,13 +59,15 @@ def parse_args():
     return p.parse_args()
 
 
-def load_baselines(path):
+def load_baselines(paths):
     """{(method, seed, dataset, shot): {eval_seed: acc}}, params {method: n}."""
     scores, params, configs = defaultdict(dict), {}, defaultdict(list)
-    if not os.path.exists(path):
-        print(f"[warn] no baseline results at {path}")
-        return scores, params
-    rows = list(csv.DictReader(open(path)))
+    rows = []
+    for path in paths:
+        if os.path.exists(path):
+            rows += list(csv.DictReader(open(path)))
+        else:
+            print(f"[warn] no baseline results at {path}")
     # if a model was run with several settings (e.g. epochs, matching_scale), keep the latest
     for r in rows:
         cfg = (r["epochs"], r["meta_batch"], r["matching_scale"])
