@@ -97,20 +97,31 @@ class ProtoNet(nn.Module):
 
 # --- B. Matching Networks (Vinyals et al., 2016) ---
 class MatchingNet(nn.Module):
-    def __init__(self):
+    """Cosine-attention Matching Network (no full-context embeddings).
+
+    The Conv4 features are post-ReLU, so every cosine similarity lies in [0, 1];
+    an unscaled softmax over them is nearly uniform (with 10 support images a
+    perfect match gets at most e/(e+9) ~ 23% of the attention), which starves
+    training. As in the reference implementation of Chen et al., "A Closer Look
+    at Few-shot Classification" (ICLR 2019), similarities are multiplied by
+    `scale` (default 100) before the softmax. scale=1 reproduces the old model.
+    """
+
+    def __init__(self, scale=100.0):
         super().__init__()
         self.backbone = Conv4(track_running_stats=True)
+        self.scale = scale
 
     def forward(self, x_supp, y_supp, x_qry, n_way):
         feat_supp = F.normalize(self.backbone(x_supp), dim=-1)
         feat_qry = F.normalize(self.backbone(x_qry), dim=-1)
 
-        sims = torch.mm(feat_qry, feat_supp.t())
-        attn = F.softmax(sims, dim=-1)
+        log_attn = F.log_softmax(self.scale * torch.mm(feat_qry, feat_supp.t()), dim=-1)  # (Q, S)
 
-        one_hot = F.one_hot(y_supp, num_classes=n_way).float()
-        probs = torch.mm(attn, one_hot)
-        return torch.log(probs + 1e-8)
+        # log p(c | x) = log sum_{i : y_i = c} attn_i, computed stably with logsumexp
+        in_class = F.one_hot(y_supp, num_classes=n_way).t().bool()                          # (C, S)
+        masked = log_attn.unsqueeze(1).masked_fill(~in_class.unsqueeze(0), float("-inf"))   # (Q, C, S)
+        return torch.logsumexp(masked, dim=-1)                                               # (Q, C)
 
 
 # --- C. Relation Networks (Sung et al., 2018) ---
@@ -270,15 +281,21 @@ def get_global_splits(dataset_name, n_way=10, k_shot=10, eval_seed=42):
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
 
+    # The task (which classes, which support images) is a function of eval_seed only.
+    # A private RandomState(eval_seed) draws exactly what np.random.seed(eval_seed) +
+    # np.random.shuffle draw in ML-NCA-Testing.py, so for the same eval_seed the
+    # baselines are scored on the same tasks as MetaLearnNCA (Table 1), independently
+    # of how much global RNG the preceding meta-training consumed.
+    rng = np.random.RandomState(eval_seed)
     support_idx, test_idx = [], []
-    available_classes = list(set(targets))
-    np.random.shuffle(available_classes)
+    available_classes = sorted(set(np.asarray(targets).tolist()))
+    rng.shuffle(available_classes)
     chosen_classes = available_classes[:n_way]
     class_to_surrogate = {true_cls: surr for surr, true_cls in enumerate(chosen_classes)}
 
     for true_cls in chosen_classes:
         pos = np.where(targets == true_cls)[0]
-        np.random.shuffle(pos)
+        rng.shuffle(pos)
         support_idx.extend(pos[:k_shot])
         test_idx.extend(pos[k_shot:])
 
@@ -314,7 +331,7 @@ def get_global_splits(dataset_name, n_way=10, k_shot=10, eval_seed=42):
 # ==========================================
 # 5. TRAINING ROUTINE
 # ==========================================
-def train_model(model_name, omni_dataset, meta_epochs=1500, meta_batch_size=32):
+def train_model(model_name, omni_dataset, meta_epochs=1500, meta_batch_size=32, matching_scale=100.0):
     print(f"\n=======================================================")
     print(f" TRAINING BASELINE: {model_name} (Meta-Batch Size: {meta_batch_size})")
     print(f"=======================================================")
@@ -322,7 +339,7 @@ def train_model(model_name, omni_dataset, meta_epochs=1500, meta_batch_size=32):
     if model_name == "ProtoNet":
         model = ProtoNet().to(DEVICE)
     elif model_name == "MatchingNet":
-        model = MatchingNet().to(DEVICE)
+        model = MatchingNet(scale=matching_scale).to(DEVICE)
     elif model_name == "RelationNet":
         model = RelationNet().to(DEVICE)
     elif model_name == "MAML":
@@ -529,9 +546,19 @@ if __name__ == "__main__":
                         help="Independent evaluation runs for 95% CI (default: 10)")
     parser.add_argument("--models", nargs="+", default=["MAML","ProtoNet", "MatchingNet", "RelationNet"], #,
                         help="Models to run: ProtoNet MatchingNet RelationNet MAML")
+    parser.add_argument("--eval_seed_start", type=int, default=43,
+                        help="Evaluation run i uses eval_seed = eval_seed_start + i. The default (43..52 for "
+                             "10 runs) matches ML-NCA-Testing.py, so baselines and MetaLearnNCA are scored on "
+                             "identical tasks.")
+    parser.add_argument("--matching_scale", type=float, default=100.0,
+                        help="MatchingNet: cosine-similarity scale before the softmax (Chen et al., 2019). "
+                             "1.0 reproduces the submitted version.")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Training seed, re-applied before each model so a model's result does not "
+                             "depend on which models were trained before it.")
     args = parser.parse_args()
 
-    set_determinism(42)
+    set_determinism(args.seed)
     os.makedirs("./data", exist_ok=True)
 
     print("Loading Omniglot Meta-Training Background Dataset...")
@@ -543,8 +570,10 @@ if __name__ == "__main__":
     results = {d: {s: {} for s in args.shots} for d in datasets}
 
     for model_name in args.models:
+        set_determinism(args.seed)
         trained_model = train_model(
-            model_name, omni_train_dataset, meta_epochs=args.epochs, meta_batch_size=args.meta_batch
+            model_name, omni_train_dataset, meta_epochs=args.epochs, meta_batch_size=args.meta_batch,
+            matching_scale=args.matching_scale
         )
         trained_model.eval()
 
@@ -559,7 +588,8 @@ if __name__ == "__main__":
                 accs, wall_times = [], []
                 for run_idx in range(args.test_runs):
                     acc, elap_t, _ = evaluate_global_dataset(
-                        trained_model, model_name, d_name, n_way=10, k_shot=k_shot, eval_seed=42 + run_idx
+                        trained_model, model_name, d_name, n_way=10, k_shot=k_shot,
+                        eval_seed=args.eval_seed_start + run_idx
                     )
                     accs.append(acc)
                     wall_times.append(elap_t)
