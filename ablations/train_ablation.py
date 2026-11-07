@@ -177,7 +177,9 @@ def main():
     latest_path = os.path.join(run_dir, "latest.pt")
     log_path = os.path.join(run_dir, "train_log.csv")
     if args.resume and os.path.exists(latest_path):
-        ck = torch.load(latest_path, map_location=device, weights_only=False)
+        # Load on the CPU: RNG states must stay CPU ByteTensors (map_location=cuda would move them to the
+        # GPU and set_rng_state rejects that); model/optimizer state is copied to the GPU by load_state_dict.
+        ck = torch.load(latest_path, map_location="cpu", weights_only=False)
         learner.load_state_dict(ck["model"])
         optimizer.load_state_dict(ck["optimizer"])
         scheduler.load_state_dict(ck["scheduler"])
@@ -185,9 +187,9 @@ def main():
         start_epoch = ck["epoch"] + 1
         skipped_steps = ck.get("skipped_steps", 0)
         random.setstate(ck["rng"]["python"]); np.random.set_state(ck["rng"]["numpy"])
-        torch.set_rng_state(ck["rng"]["torch"])
+        torch.set_rng_state(ck["rng"]["torch"].cpu())
         if device.type == "cuda" and ck["rng"].get("cuda") is not None:
-            torch.cuda.set_rng_state(ck["rng"]["cuda"], device)
+            torch.cuda.set_rng_state(ck["rng"]["cuda"].cpu(), device)
         print(f"Resumed from epoch {ck['epoch']}")
     else:
         with open(log_path, "w", newline="") as f:
