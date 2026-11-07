@@ -58,6 +58,17 @@ Test-time recurrence (R3's "long recurrent unrolling") also needs no retraining:
 
 ## How to run
 
+One command for everything (8 variants × 5 seeds, then evaluation and tables); safe to re-run, it
+resumes interrupted runs and skips finished ones:
+
+```bash
+VARIANTS=all SEEDS="0 1 2 3 4" GPUS="0" bash ablations/run_ablations.sh
+```
+
+A run that hits a CUDA out-of-memory error (most likely `grad_on_s`) automatically halves its
+micro-batch and doubles the accumulation passes, so each optimiser step still uses 16 tasks; the
+change is recorded in its `status.json`. Step by step:
+
 ```bash
 # 0. CPU smoke test of every variant (synthetic data, ~1 min)
 for v in full global_program no_mask grad_on_s nca_protonet no_feedback noncellular_updater short_unroll; do

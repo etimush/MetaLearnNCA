@@ -200,21 +200,43 @@ def main():
     d = L.TRAIN_DEFAULTS
     t_start = time.time()
     status, epoch = "ok", start_epoch - 1
+    oom_fallbacks = []
     for epoch in range(start_epoch, epochs + 1):
         t_ep = time.time()
-        optimizer.zero_grad(set_to_none=True)
-        loss_sum, acc_sum, finite = 0.0, 0.0, True
-        for _ in range(accum):
-            supp_x, supp_y, qry_x, qry_y = L.sample_meta_batch(bank, micro, d["n_way"], d["n_supp"], d["n_qry"])
-            N = random.randint(n_base, n_base + 3)
-            K = random.randint(k_base, k_base + 2)
-            with L.amp_context(device, amp_dtype):
-                loss, acc = learner.episode(supp_x, supp_y, qry_x, qry_y, micro, K, N)
-            scaler.scale(loss / accum).backward()
-            lv = loss.item()
-            finite &= math.isfinite(lv)
-            loss_sum += lv
-            acc_sum += acc.item()
+        while True:
+            optimizer.zero_grad(set_to_none=True)
+            loss_sum, acc_sum, finite, oom = 0.0, 0.0, True, False
+            try:
+                for _ in range(accum):
+                    supp_x, supp_y, qry_x, qry_y = L.sample_meta_batch(bank, micro, d["n_way"], d["n_supp"], d["n_qry"])
+                    N = random.randint(n_base, n_base + 3)
+                    K = random.randint(k_base, k_base + 2)
+                    with L.amp_context(device, amp_dtype):
+                        loss, acc = learner.episode(supp_x, supp_y, qry_x, qry_y, micro, K, N)
+                    scaler.scale(loss / accum).backward()
+                    lv = loss.item()
+                    finite &= math.isfinite(lv)
+                    loss_sum += lv
+                    acc_sum += acc.item()
+            except torch.cuda.OutOfMemoryError:
+                oom = True
+            if not oom:
+                break
+            # Out of GPU memory: halve the micro-batch and double the accumulation passes, so every
+            # optimiser step still sees the same number of tasks, and redo this epoch.
+            loss = acc = None
+            optimizer.zero_grad(set_to_none=True)
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            if micro == 1:
+                raise RuntimeError(f"{args.variant}: out of GPU memory even with --micro_batch 1. Free the GPU "
+                                   "(fewer JOBS_PER_GPU) or, for grad_on_s, add --first_order and report it.")
+            tasks = micro * accum
+            micro = max(1, micro // 2)
+            accum = math.ceil(tasks / micro)
+            oom_fallbacks.append(dict(epoch=epoch, micro_batch=micro, accum=accum))
+            print(f"[oom] {args.variant} seed {args.seed}: out of GPU memory at epoch {epoch}; retrying with "
+                  f"--micro_batch {micro} --accum {accum} ({micro * accum} tasks per step)", flush=True)
 
         scaler.unscale_(optimizer)
         gn = torch.nn.utils.clip_grad_norm_(params, max_norm=args.grad_clip)
@@ -270,7 +292,8 @@ def main():
                    os.path.join(run_dir, "meta_nca.pth"))
     L.write_json(status_path, dict(status=status, epochs_completed=epoch, epochs_planned=epochs,
                                    wall_time_s=wall, skipped_steps=skipped_steps,
-                                   peak_train_mem_mb=peak, n_params=L.count_params(learner)))
+                                   peak_train_mem_mb=peak, n_params=L.count_params(learner),
+                                   micro_batch_final=micro, accum_final=accum, oom_fallbacks=oom_fallbacks))
     print(f"Finished {args.variant} seed {args.seed}: {status} after {epoch} epochs "
           f"({wall / 60:.1f} min). -> {run_dir}")
 

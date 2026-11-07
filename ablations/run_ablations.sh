@@ -2,13 +2,15 @@
 # Train all ablation runs, then evaluate them and build the tables.
 #
 # Usage (from the repository root):
+#   VARIANTS=all SEEDS="0 1 2 3 4" bash ablations/run_ablations.sh   # everything: 8 variants x 5 seeds + tables
 #   bash ablations/run_ablations.sh                                  # main table, 1 GPU
 #   GPUS="0 1 2" bash ablations/run_ablations.sh                     # spread over 3 GPUs
 #   GPUS="0" JOBS_PER_GPU=3 bash ablations/run_ablations.sh          # 3 concurrent runs on one GPU
 #   VARIANTS="no_feedback noncellular_updater short_unroll" bash ablations/run_ablations.sh   # appendix
 #
 # Environment variables:
-#   VARIANTS      default: full global_program no_mask grad_on_s nca_protonet
+#   VARIANTS      main (default: full global_program no_mask grad_on_s nca_protonet),
+#                 appendix (no_feedback noncellular_updater short_unroll), all, or an explicit list
 #   SEEDS         default: 0 1 2
 #   GPUS          default: 0           (space separated CUDA device ids)
 #   JOBS_PER_GPU  default: 1           (a full-model run needs ~4 GB; grad_on_s needs much more)
@@ -24,7 +26,14 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-VARIANTS=${VARIANTS:-"full global_program no_mask grad_on_s nca_protonet"}
+MAIN_VARIANTS="full global_program no_mask grad_on_s nca_protonet"
+APPENDIX_VARIANTS="no_feedback noncellular_updater short_unroll"
+VARIANTS=${VARIANTS:-main}
+case "$VARIANTS" in
+  main) VARIANTS="$MAIN_VARIANTS" ;;
+  appendix) VARIANTS="$APPENDIX_VARIANTS" ;;
+  all) VARIANTS="$MAIN_VARIANTS $APPENDIX_VARIANTS" ;;
+esac
 SEEDS=${SEEDS:-"0 1 2"}
 GPUS=${GPUS:-0}
 JOBS_PER_GPU=${JOBS_PER_GPU:-1}
@@ -61,7 +70,7 @@ for w in $(seq 0 $((workers - 1))); do
               --variant "$v" --seed "$s" --out_dir "$OUT" --resume $EXTRA 2>&1 \
           | tee "$log" \
           | if [ "$QUIET" = "1" ]; then cat > /dev/null; else
-              grep --line-buffered -E "\] ep |Starting|Resumed|\[skip\]|\[diverged\]|Finished|materialising|Error|Traceback|Killed"; fi
+              grep --line-buffered -E "\] ep |\[oom\]|Starting|Resumed|\[skip\]|\[diverged\]|Finished|materialising|Error|Traceback|Killed"; fi
         if [ "${PIPESTATUS[0]}" != "0" ]; then
           echo "FAILED: $v seed $s (see $log)"
         fi
@@ -83,4 +92,5 @@ if [ "$RUN_EVAL" = "1" ]; then
   fi
   CUDA_VISIBLE_DEVICES=${gpu_arr[0]} python ablations/eval_ablation.py \
       --runs_dir "$OUT" --out_dir ablation_results "${orig_args[@]}"
+  echo "Tables: ablation_results/ablation_tables.md and ablation_results/ablation_tables.tex"
 fi
