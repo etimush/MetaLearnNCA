@@ -206,7 +206,7 @@ def main():
         t_ep = time.time()
         while True:
             optimizer.zero_grad(set_to_none=True)
-            loss_sum, acc_sum, finite, oom = 0.0, 0.0, True, False
+            stats, oom = [], False   # (loss, acc) per pass, kept on the GPU: one sync per epoch
             try:
                 for _ in range(accum):
                     supp_x, supp_y, qry_x, qry_y = L.sample_meta_batch(bank, micro, d["n_way"], d["n_supp"], d["n_qry"])
@@ -215,17 +215,16 @@ def main():
                     with L.amp_context(device, amp_dtype):
                         loss, acc = learner.episode(supp_x, supp_y, qry_x, qry_y, micro, K, N)
                     scaler.scale(loss / accum).backward()
-                    lv = loss.item()
-                    finite &= math.isfinite(lv)
-                    loss_sum += lv
-                    acc_sum += acc.item()
+                    stats.append(torch.stack([loss.detach().float(), acc.detach().float()]))
             except torch.cuda.OutOfMemoryError:
                 oom = True
             if not oom:
+                loss_sum, acc_sum = torch.stack(stats).sum(0).tolist()
+                finite = math.isfinite(loss_sum)   # non-finite if any pass was
                 break
             # Out of GPU memory: halve the micro-batch and double the accumulation passes, so every
             # optimiser step still sees the same number of tasks, and redo this epoch.
-            loss = acc = None
+            loss = acc = stats = None
             optimizer.zero_grad(set_to_none=True)
             if device.type == "cuda":
                 torch.cuda.empty_cache()
