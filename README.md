@@ -56,6 +56,7 @@ Once adaptation concludes on the support set, $S_{\text{task}}$ is frozen and br
 | `ML-NCA-Cross-dataset-Testing.py` | Exhaustive $6 \times 6$ cross-dataset transfer benchmark evaluating all source-target dataset pairs across 50 seeds, outputting LaTeX/CSV matrices and publication heatmaps. |
 | `ML-NCA-Ablation.py` | Full ablation suite: ablates dynamic channels (10–31) and program channels (0–23), runs circular damage studies, additive noise injections, and visual channel atlas generators. |
 | `ML-NCA-Optim-surface.py` | Computes and plots 3D generalization landscape surfaces (Shots vs. Interaction Repeats $k$ vs. Accuracy). |
+| `ablations/` | **Component ablations for the ICLR revision** (global program, no mask, gradient-on-S, NCA-ProtoNet, + appendix variants), paired evaluation and test-time recurrence/stability sweeps. See [`ablations/README.md`](ablations/README.md). |
 | `Train-Canonical-Models.py` | Canonical baselines benchmark suite: trains and evaluates **ProtoNet**, **MatchingNet**, **RelationNet**, and **FOMAML** using identical Conv4-64 backbones and data pipelines. |
 
 ---
