@@ -16,6 +16,7 @@
 #   EXTRA         extra flags passed to every train_ablation.py call
 #   RUN_EVAL      default: 1           (evaluate + build tables when training is done)
 #   ORIG_SEEDS    original checkpoints to add as a reference row, e.g. "0 1 6" (default: none)
+#   QUIET         1 = do not echo progress lines to the terminal (they are always in $OUT/logs/)
 #
 # Jobs are ordered seed-major (all variants for seed 0 first), so a partial
 # sweep already gives one seed per variant. Every job uses --resume, so
@@ -31,6 +32,7 @@ OUT=${OUT:-ablation_runs}
 EXTRA=${EXTRA:-}
 RUN_EVAL=${RUN_EVAL:-1}
 ORIG_SEEDS=${ORIG_SEEDS:-}
+QUIET=${QUIET:-0}
 LOGDIR="$OUT/logs"
 mkdir -p "$LOGDIR"
 
@@ -51,12 +53,17 @@ for w in $(seq 0 $((workers - 1))); do
     for i in "${!jobs[@]}"; do
       if (( i % workers == w )); then
         read -r v s <<< "${jobs[$i]}"
-        echo "[worker $w | GPU $gpu] $v seed $s"
+        log="$LOGDIR/${v}_seed${s}.log"
+        echo "[worker $w | GPU $gpu] $v seed $s  (full log: $log)"
+        # Full output goes to the log; progress / status lines are also echoed here.
         # shellcheck disable=SC2086
-        if ! CUDA_VISIBLE_DEVICES=$gpu python ablations/train_ablation.py \
-              --variant "$v" --seed "$s" --out_dir "$OUT" --resume $EXTRA \
-              > "$LOGDIR/${v}_seed${s}.log" 2>&1; then
-          echo "FAILED: $v seed $s (see $LOGDIR/${v}_seed${s}.log)"
+        CUDA_VISIBLE_DEVICES=$gpu PYTHONUNBUFFERED=1 python ablations/train_ablation.py \
+              --variant "$v" --seed "$s" --out_dir "$OUT" --resume $EXTRA 2>&1 \
+          | tee "$log" \
+          | if [ "$QUIET" = "1" ]; then cat > /dev/null; else
+              grep --line-buffered -E "\] ep |Starting|Resumed|\[skip\]|\[diverged\]|Finished|materialising|Error|Traceback|Killed"; fi
+        if [ "${PIPESTATUS[0]}" != "0" ]; then
+          echo "FAILED: $v seed $s (see $log)"
         fi
       fi
     done

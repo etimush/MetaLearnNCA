@@ -162,6 +162,8 @@ def main():
         bank = L.load_omniglot_train_bank(args.data_root)
     bank = bank.to(device)
     print(f"Train bank: {tuple(bank.shape)} on {device}")
+    print(f"Starting {args.variant} seed {args.seed}: {epochs} epochs, progress every {args.log_every} epochs"
+          + (" (first epoch includes torch.compile, ~1-3 min)" if use_compile else ""), flush=True)
 
     # ---------------- optimisation ----------------
     params = [p for p in learner.parameters() if p.requires_grad]
@@ -236,7 +238,7 @@ def main():
 
         if epoch % args.log_every == 0 or epoch == 1:
             sec = time.time() - t_ep
-            ilr = float(learner.inner_lr().mean()) if hasattr(learner, "log_inner_lr") else float("nan")
+            ilr = float(learner.inner_lr().detach().mean()) if hasattr(learner, "log_inner_lr") else float("nan")
             row = [epoch, loss_sum / accum, 100.0 * acc_sum / accum, scheduler.get_last_lr()[0],
                    float(gn), ilr, sec, skipped_steps]
             with open(log_path, "a", newline="") as f:
