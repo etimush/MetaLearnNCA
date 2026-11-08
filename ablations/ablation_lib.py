@@ -521,7 +521,8 @@ def save_run_checkpoint(path, learner, variant, opts, extra=None):
                "state_dict": {k: v.detach().cpu() for k, v in learner.state_dict().items()}}
     if extra:
         payload.update(extra)
-    torch.save(payload, path)
+    torch.save(payload, path + ".tmp")
+    os.replace(path + ".tmp", path)
 
 
 def load_run_checkpoint(path, device="cpu"):

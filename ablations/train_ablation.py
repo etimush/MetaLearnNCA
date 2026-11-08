@@ -348,7 +348,8 @@ def main():
                             rng=dict(python=random.getstate(), numpy=np.random.get_state(),
                                      torch=torch.get_rng_state(),
                                      cuda=torch.cuda.get_rng_state(device) if device.type == "cuda" else None)),
-                       latest_path)
+                       latest_path + ".tmp")
+            os.replace(latest_path + ".tmp", latest_path)    # atomic: never a half-written latest.pt
             L.write_json(status_path, dict(status="running", epoch=epoch))
         epoch += 1
     epoch = min(epoch, epochs)
