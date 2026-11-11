@@ -47,6 +47,7 @@ from {0.005, 0.01, 0.02, 0.05, 0.1}; the choice is recorded.
 | Method | Size knob | Parameters |
 | --- | --- | --- |
 | MetaLearnNCA | hidden width 251 (both NCAs) | 112,950 (−0.12%) |
+| MetaLearnNCA, image-conditioned updater | hidden width 245 (both NCAs) | 113,190 (+0.09%) |
 | NCA-ProtoNet | hidden width 329 (+ learned 24×32×32 program) | 113,077 (−0.01%) |
 | ProtoNet | Conv4 width 64 | 113,088 |
 | MatchingNet | Conv4 width 64 | 113,088 |
@@ -59,6 +60,14 @@ from {0.005, 0.01, 0.02, 0.05, 0.1}; the choice is recorded.
   **no foreground mask**: the residual `E = Y − softmax(logits)`, the query loss and the
   read-out (mean of the logit channels) use every pixel. Step jitter N′∈[16,19], K′∈[3,5];
   test N=19, K=5.
+* **MetaLearnNCA, image-conditioned updater** (`metalearnnca_img`): identical, except that the
+  Meta-NCA reads `[E, support image]` instead of `E`. Without a mask, plain MetaLearnNCA
+  collapses on FC100 (loss stays at ln 5): once predictions are uniform, `E` is the same flat
+  field for every image, the program carries no task information, and nothing restarts learning.
+  Giving the updater the image breaks that loop, as the mask did on Omniglot. This is a change
+  to the method: report it as a separate row, next to plain MetaLearnNCA. Its Omniglot
+  counterpart is the ablation variant `img_conditioned` (mask kept), which shows whether the
+  change affects the original results.
 * **NCA-ProtoNet**: the same Active-NCA as an embedding (mean of its 32 state channels over all
   pixels), prototypes and squared Euclidean distance, one learned task-independent program.
 * **ProtoNet / MatchingNet / RelationNet / FOMAML**: as in `Train-Canonical-Models.py` (Conv4,
@@ -70,6 +79,9 @@ from {0.005, 0.01, 0.02, 0.05, 0.1}; the choice is recorded.
 ```bash
 # everything: 6 methods x 5 seeds (seed-major), then evaluation and table
 bash cifar/run_cifar.sh
+
+# e.g. without the (collapsing) plain MetaLearnNCA:
+METHODS="metalearnnca_img nca_protonet protonet matchingnet relationnet fomaml" bash cifar/run_cifar.sh
 
 # evaluation / table only (resumable; finished runs are cached in <run>/eval_fc100.json)
 python cifar/eval_cifar.py --runs_dir cifar_runs
@@ -88,12 +100,10 @@ python cifar/eval_cifar.py --runs_dir /tmp/cifar_smoke --fake_data --episodes 8 
 
 ## Things to know before reading the results
 
-* **MetaLearnNCA without the mask may not learn.** On Omniglot, the `no_mask` ablation collapsed
-  to uniform predictions (loss = ln 10): once predictions are uniform, the unmasked residual is
-  spatially constant and carries no image information. Natural images have no blank background,
-  so this may or may not happen here. If the loss sits at ln 5 ≈ 1.609 with a vanishing gradient
-  norm, that is the same collapse; report it as a limitation (the error-driven updater needs a
-  spatially informative residual), rather than changing the method only for CIFAR.
+* **Plain MetaLearnNCA without the mask does not learn on FC100.** Observed on seed 0: the loss
+  stays at ln 5 ≈ 1.609 with a vanishing gradient norm, the same collapse as the `no_mask`
+  ablation on Omniglot. Report it as a scope limitation (the error-driven updater needs a
+  spatially informative residual), and show the image-conditioned variant as a separate row.
 * **Compute.** By my estimate (not measured on a GPU), a MetaLearnNCA run costs ~1.3× an
   Omniglot run (32×32 RGB vs 28×28 grey), roughly 1.5–2 h on an RTX 4070 Ti; NCA-ProtoNet about
   a third of that; the Conv4 baselines minutes each (FOMAML longer). Evaluation of an NCA run

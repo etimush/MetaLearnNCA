@@ -105,7 +105,7 @@ def main():
             print(f"[info] resuming with the run's original precision {prev}")
             amp_dtype = names[prev]
 
-    is_nca = args.method in ("metalearnnca", "nca_protonet")
+    is_nca = args.method in ("metalearnnca", "metalearnnca_img", "nca_protonet")
     use_compile = is_nca and (args.compile == "on" or (args.compile == "auto" and device.type == "cuda"))
     if use_compile:
         for nca in (learner.active, getattr(learner, "meta", None)):

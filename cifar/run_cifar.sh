@@ -2,12 +2,12 @@
 # FC100 (CIFAR-100) few-shot experiment: train every method x seed, then evaluate and build the table.
 #
 # Usage (from the repository root):
-#   bash cifar/run_cifar.sh                                   # all 6 methods x 5 seeds, then evaluation
+#   bash cifar/run_cifar.sh                                   # all 7 methods x 5 seeds, then evaluation
 #   METHODS="protonet matchingnet relationnet fomaml" bash cifar/run_cifar.sh     # Conv4 baselines only
 #   GPUS="0 1" JOBS_PER_GPU=2 bash cifar/run_cifar.sh         # parallel workers
 #
 # Environment variables:
-#   METHODS       default: metalearnnca nca_protonet protonet matchingnet relationnet fomaml
+#   METHODS       default: metalearnnca metalearnnca_img nca_protonet protonet matchingnet relationnet fomaml
 #   SEEDS         default: 0 1 2 3 4
 #   GPUS          default: 0
 #   JOBS_PER_GPU  default: 1   (the NCA runs need most of a 12 GB card; Conv4 runs are small)
@@ -21,7 +21,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-METHODS=${METHODS:-"metalearnnca nca_protonet protonet matchingnet relationnet fomaml"}
+METHODS=${METHODS:-"metalearnnca metalearnnca_img nca_protonet protonet matchingnet relationnet fomaml"}
 SEEDS=${SEEDS:-"0 1 2 3 4"}
 GPUS=${GPUS:-0}
 JOBS_PER_GPU=${JOBS_PER_GPU:-1}

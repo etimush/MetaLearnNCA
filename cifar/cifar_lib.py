@@ -54,10 +54,11 @@ REGIME = dict(
 NCA_STEPS = dict(n_steps=16, k_repeats=3)       # jitter N' in [N, N+3], K' in [K, K+2]; test N+3, K+2
 FOMAML_INNER = dict(steps=5, lr=0.01)           # training value; the test value is chosen on val classes
 
-METHODS = ["metalearnnca", "nca_protonet", "protonet", "matchingnet", "relationnet", "fomaml"]
-METHOD_LABELS = {"metalearnnca": "MetaLearnNCA", "nca_protonet": "NCA-ProtoNet", "protonet": "ProtoNet",
+METHODS = ["metalearnnca", "metalearnnca_img", "nca_protonet", "protonet", "matchingnet", "relationnet", "fomaml"]
+METHOD_LABELS = {"metalearnnca": "MetaLearnNCA", "metalearnnca_img": "MetaLearnNCA (image-conditioned updater)",
+                 "nca_protonet": "NCA-ProtoNet", "protonet": "ProtoNet",
                  "matchingnet": "MatchingNet", "relationnet": "RelationNet", "fomaml": "FOMAML"}
-TEST_TIME_GRADIENTS = {"metalearnnca": "No", "nca_protonet": "No", "protonet": "No", "matchingnet": "No",
+TEST_TIME_GRADIENTS = {"metalearnnca": "No", "metalearnnca_img": "No", "nca_protonet": "No", "protonet": "No", "matchingnet": "No",
                        "relationnet": "No", "fomaml": "Yes"}
 
 # ---------------------------------------------------------------------------------------------
@@ -341,8 +342,10 @@ class ActiveNCA(BaseNCA):
 
 
 class MetaNCA(BaseNCA):
-    def __init__(self, n_way, hidden):
-        super().__init__(n_way + DYN_CH, DYN_CH, hidden)
+    """Reads [residual E (n_way channels), optionally the support image (extra_in channels), own state]."""
+
+    def __init__(self, n_way, hidden, extra_in=0):
+        super().__init__(n_way + extra_in + DYN_CH, DYN_CH, hidden)
 
     def forward(self, signal, dyn, steps):
         if dyn is None:
@@ -358,13 +361,16 @@ def _broadcast(S, n):
 class MetaLearnNCA(nn.Module):
     """Active-NCA + Meta-NCA. Adaptation: K interactions of [Active-NCA on support (2N steps) ->
     residual E = Y - softmax(logits) at EVERY pixel -> Meta-NCA (N steps) -> program = support mean
-    of the Meta-NCA's first 24 channels]. Prediction: mean of the logit channels over all pixels."""
+    of the Meta-NCA's first 24 channels]. Prediction: mean of the logit channels over all pixels.
+    image_conditioned=True (method metalearnnca_img): the Meta-NCA reads [E, support image]."""
 
-    def __init__(self, n_way, hidden, n_steps=NCA_STEPS["n_steps"], k_repeats=NCA_STEPS["k_repeats"]):
+    def __init__(self, n_way, hidden, n_steps=NCA_STEPS["n_steps"], k_repeats=NCA_STEPS["k_repeats"],
+                 image_conditioned=False):
         super().__init__()
         self.n_way, self.n_steps, self.k_repeats = n_way, n_steps, k_repeats
+        self.image_conditioned = image_conditioned
         self.active = ActiveNCA(hidden)
-        self.meta = MetaNCA(n_way, hidden)
+        self.meta = MetaNCA(n_way, hidden, extra_in=IN_CH if image_conditioned else 0)
 
     def adapt(self, supp_x, supp_y, K, N):
         T, S = supp_x.shape[:2]
@@ -375,7 +381,10 @@ class MetaLearnNCA(nn.Module):
         for _ in range(K):
             dyn = self.active(x, _broadcast(prog, S), 2 * N)
             E = y_sp - F.softmax(dyn[:, :self.n_way].float(), dim=1)     # no mask: every pixel
-            D = self.meta(E, D, N)
+            # image-conditioned variant: the updater also sees each support image, so its input
+            # carries image structure even when the predictions (and hence E) are spatially uniform
+            signal = torch.cat([E, x.float()], dim=1) if self.image_conditioned else E
+            D = self.meta(signal, D, N)
             prog = D.view(T, S, DYN_CH, IMG, IMG)[:, :, :PROGRAM_CH].mean(dim=1)
         return prog
 
@@ -451,6 +460,8 @@ def _make(method, n_way, size):
         return FOMAML(n_way, width=size[0])
     if method == "metalearnnca":
         return MetaLearnNCA(n_way, hidden=size[0])
+    if method == "metalearnnca_img":
+        return MetaLearnNCA(n_way, hidden=size[0], image_conditioned=True)
     if method == "nca_protonet":
         return NCAProtoNet(n_way, hidden=size[0])
     raise ValueError(method)

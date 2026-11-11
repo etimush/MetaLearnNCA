@@ -76,6 +76,7 @@ class VariantSpec:
     updater: str = "meta_nca"           # meta_nca | gradient | label_only | prototype
     updater_perception: str = "sobel"   # sobel (3x3 identity/sobel/laplacian) | identity (1x1)
     use_mask: bool = True
+    updater_image: bool = False         # Meta-NCA also reads the support image ([E, X] instead of E)
     n_steps: int = 16       # base inner steps N (train jitter N' in [N, N+3]; test N+3)
     k_repeats: int = 3      # base interactions K (train jitter K' in [K, K+2]; test K+2)
 
@@ -124,6 +125,12 @@ VARIANTS: Dict[str, VariantSpec] = {
         "base inner steps N=8 instead of 16 (train N' in [8,11], test N=11)",
         "Is long recurrent unrolling necessary?", "R3",
         tier="appendix", n_steps=8),
+    "img_conditioned": VariantSpec(
+        "img_conditioned", "Image-conditioned updater",
+        "Meta-NCA reads [E, support image] instead of E (mask kept); Meta-NCA hidden width 251 so the "
+        "parameter count is unchanged. This is the mask-free fix used on CIFAR (FC100)",
+        "Does conditioning the updater on the image change the Omniglot results?", "-",
+        tier="appendix", updater_image=True),
 }
 
 MAIN_VARIANTS = [v for v, s in VARIANTS.items() if s.tier == "main"]
@@ -240,8 +247,8 @@ class ActiveNCA(BaseNCA):
 
 
 class MetaNCA(BaseNCA):
-    def __init__(self, hidden=256, perception="sobel", w2_init_scale=0.2):
-        super().__init__(LOSS_CHN + META_DYN_CHN, META_DYN_CHN, hidden,
+    def __init__(self, hidden=256, perception="sobel", w2_init_scale=0.2, extra_in=0):
+        super().__init__(LOSS_CHN + extra_in + META_DYN_CHN, META_DYN_CHN, hidden,
                          perception, w2_init_scale)
 
     def forward(self, signal, dyn=None, steps=16):
@@ -249,6 +256,13 @@ class MetaNCA(BaseNCA):
         if dyn is None:
             dyn = torch.rand(B, META_DYN_CHN, H, W, device=signal.device)
         return self.run(signal, dyn, steps)
+
+
+def matched_image_hidden(hidden: int) -> int:
+    """Hidden width for a Meta-NCA that also reads the (1-channel) image, same #params as the original."""
+    c_in = LOSS_CHN + META_DYN_CHN
+    full = 4 * c_in * hidden + hidden + hidden * META_DYN_CHN
+    return int(round(full / (4 * (c_in + 1) + 1 + META_DYN_CHN)))
 
 
 def matched_identity_hidden(hidden: int) -> int:
@@ -300,7 +314,10 @@ class ProgramLearner(nn.Module):
             hidden = opts["hidden"]
             if spec.updater_perception == "identity" and opts.get("match_params", True):
                 hidden = matched_identity_hidden(hidden)
-            self.meta = MetaNCA(hidden, spec.updater_perception, opts["w2_init_scale"])
+            extra_in = 1 if spec.updater_image else 0        # Omniglot images have one channel
+            if extra_in and opts.get("match_params", True):
+                hidden = matched_image_hidden(hidden)
+            self.meta = MetaNCA(hidden, spec.updater_perception, opts["w2_init_scale"], extra_in=extra_in)
         elif spec.updater == "gradient":
             assert spec.program == "spatial"
             lr0 = math.log(opts["inner_lr"] if opts.get("inner_lr") else DEFAULT_INNER_LR)
@@ -370,6 +387,8 @@ class ProgramLearner(nn.Module):
                 dyn = self.active(supp_x, broadcast_program(S, n_supp), steps=2 * N)
                 probs = F.softmax(dyn[:, :LOSS_CHN].float(), dim=1)
                 signal = (y_sp - probs) * mask          # Eq. 3
+            if self.spec.updater_image:
+                signal = torch.cat([signal, supp_x.float()], dim=1)
             D = self.meta(signal, D, steps=N)
             S = self.program_from_meta(D, n_tasks)
             if callback is not None:

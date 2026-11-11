@@ -26,6 +26,7 @@ of MetaLearnNCA; everything else is the training protocol of
 | `no_feedback` | Meta-NCA reads Y_spatial ⊙ M (labelled strokes) instead of the residual Y − softmax(logits), so Active-NCA predictions never reach the updater (open loop) | Is adaptation actually error-driven? | R2, R3 | appendix |
 | `noncellular_updater` | Meta-NCA perception reduced to the identity kernel (1×1, no neighbourhood communication); hidden width 686 instead of 256 so the parameter count is unchanged | Does the updater need local diffusion of errors? | R1, R3 | appendix |
 | `short_unroll` | base N = 8 instead of 16 (train N′ ∈ [8, 11], test N = 11) | Is long recurrent unrolling necessary? | R3 | appendix |
+| `img_conditioned` | Meta-NCA reads [E, support image] instead of E (mask kept); its hidden width is reduced to 251 so the parameter count is unchanged (118,271). This is the mask-free fix used on CIFAR | Does conditioning the updater on the image change the Omniglot results? | – | appendix |
 
 Test-time recurrence (R3's "long recurrent unrolling") also needs no retraining:
 `eval_recurrence.py` sweeps K up to 50 and N from 4 to 32 on existing checkpoints.

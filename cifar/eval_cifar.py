@@ -167,7 +167,7 @@ def summarize(args, runs):
         baselines = [m for m in ("protonet", "matchingnet", "relationnet", "fomaml") if per_seed.get(m)]
         if baselines:
             best = max(baselines, key=lambda m: np.mean(per_seed[m]))
-            for m in ("metalearnnca", "nca_protonet"):
+            for m in ("metalearnnca", "metalearnnca_img", "nca_protonet"):
                 if per_seed.get(m):
                     d, hw = welch(per_seed[m], per_seed[best])
                     cells[(m, shot, "delta")] = (d, hw, best)
