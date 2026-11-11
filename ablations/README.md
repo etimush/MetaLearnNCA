@@ -27,6 +27,7 @@ of MetaLearnNCA; everything else is the training protocol of
 | `noncellular_updater` | Meta-NCA perception reduced to the identity kernel (1×1, no neighbourhood communication); hidden width 686 instead of 256 so the parameter count is unchanged | Does the updater need local diffusion of errors? | R1, R3 | appendix |
 | `short_unroll` | base N = 8 instead of 16 (train N′ ∈ [8, 11], test N = 11) | Is long recurrent unrolling necessary? | R3 | appendix |
 | `img_conditioned` | Meta-NCA reads [E, support image] instead of E (mask kept); its hidden width is reduced to 251 so the parameter count is unchanged (118,271). This is the mask-free fix used on CIFAR | Does conditioning the updater on the image change the Omniglot results? | – | appendix |
+| `no_mask_img` | mask removed everywhere (as `no_mask`) and the Meta-NCA reads [E, support image] (as `img_conditioned`); hidden 251, 118,271 parameters. The CIFAR setting, on Omniglot | Does giving the updater the image replace the mask? | R1, R3 | appendix |
 
 Test-time recurrence (R3's "long recurrent unrolling") also needs no retraining:
 `eval_recurrence.py` sweeps K up to 50 and N from 4 to 32 on existing checkpoints.

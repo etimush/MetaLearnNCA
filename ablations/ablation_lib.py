@@ -131,6 +131,12 @@ VARIANTS: Dict[str, VariantSpec] = {
         "parameter count is unchanged. This is the mask-free fix used on CIFAR (FC100)",
         "Does conditioning the updater on the image change the Omniglot results?", "-",
         tier="appendix", updater_image=True),
+    "no_mask_img": VariantSpec(
+        "no_mask_img", "No mask + image-conditioned updater",
+        "mask removed everywhere (as no_mask) and the Meta-NCA reads [E, support image] (as "
+        "img_conditioned); hidden width 251. This is the CIFAR (FC100) setting, on Omniglot",
+        "Does giving the updater the image replace the mask?", "R1, R3",
+        tier="appendix", use_mask=False, updater_image=True),
 }
 
 MAIN_VARIANTS = [v for v, s in VARIANTS.items() if s.tier == "main"]

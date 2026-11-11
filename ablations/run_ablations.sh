@@ -10,7 +10,7 @@
 #
 # Environment variables:
 #   VARIANTS      main (default: full global_program no_mask grad_on_s nca_protonet),
-#                 appendix (no_feedback noncellular_updater short_unroll img_conditioned), all, or an explicit list
+#                 appendix (no_feedback noncellular_updater short_unroll img_conditioned no_mask_img), all, or an explicit list
 #   SEEDS         default: 0 1 2
 #   GPUS          default: 0           (space separated CUDA device ids)
 #   JOBS_PER_GPU  default: 1           (a full-model run needs ~4 GB; grad_on_s needs much more)
@@ -27,7 +27,7 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 MAIN_VARIANTS="full global_program no_mask grad_on_s nca_protonet"
-APPENDIX_VARIANTS="no_feedback noncellular_updater short_unroll img_conditioned"
+APPENDIX_VARIANTS="no_feedback noncellular_updater short_unroll img_conditioned no_mask_img"
 VARIANTS=${VARIANTS:-main}
 case "$VARIANTS" in
   main) VARIANTS="$MAIN_VARIANTS" ;;
