@@ -5,3 +5,7 @@ __pycache__/
 # ablation study: resume checkpoints (optimizer state) are large and only needed while training
 ablation_runs/**/latest.pt
 ablation_runs/logs/
+
+# CIFAR / FC100 experiment: resume checkpoints and logs
+cifar_runs/**/latest.pt
+cifar_runs/logs/
