@@ -48,6 +48,9 @@ def parse_args():
     p.add_argument("--fomaml_lrs", nargs="+", type=float, default=[0.005, 0.01, 0.02, 0.05, 0.1],
                    help="candidate test-time inner learning rates for FOMAML (selected on validation classes)")
     p.add_argument("--val_episodes", type=int, default=200)
+    p.add_argument("--checkpoint", choices=["best", "final"], default="best",
+                   help="best: checkpoint with the best validation accuracy (selected during training); "
+                        "final: the last update")
     p.add_argument("--include_diverged", action="store_true")
     p.add_argument("--force", action="store_true", help="re-evaluate runs that already have results")
     p.add_argument("--data_root", default="./data")
@@ -90,13 +93,16 @@ def episode_accuracies(model, bank, shot, n_episodes, args, seed, device):
 def evaluate_run(run, banks, args, device):
     out_path = os.path.join(run["dir"], "eval_fc100.json")
     protocol = dict(episodes=args.episodes, query=args.query, episode_seed=args.episode_seed, shots=args.shots,
-                    fake_data=args.fake_data, val_episodes=args.val_episodes, fomaml_lrs=args.fomaml_lrs)
+                    fake_data=args.fake_data, val_episodes=args.val_episodes, fomaml_lrs=args.fomaml_lrs,
+                    checkpoint=args.checkpoint)
     if os.path.exists(out_path) and not args.force:
         prev = json.load(open(out_path))
         if prev.get("protocol") == protocol:
             return prev
-    model, ck = load_model(run["dir"], device)
-    result = dict(method=run["method"], seed=run["seed"], n_params=ck["n_params"], protocol=protocol, shots={})
+    model, ck = load_model(run["dir"], device, which=args.checkpoint)
+    result = dict(method=run["method"], seed=run["seed"], n_params=ck["n_params"], protocol=protocol, shots={},
+                  checkpoint_file=ck["checkpoint_file"], checkpoint_update=ck.get("update"))
+    print(f"  {run['method']} seed {run['seed']}: {ck['checkpoint_file']} (update {ck.get('update')})", flush=True)
     t0 = time.time()
     for shot in args.shots:
         if run["method"] == "fomaml":

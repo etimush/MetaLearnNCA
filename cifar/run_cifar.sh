@@ -74,7 +74,7 @@ for w in $(seq 0 $((workers - 1))); do
               --method "$m" --seed "$s" --out_dir "$OUT" --resume $EXTRA 2>&1 \
           | tee "$log" \
           | if [ "$QUIET" = "1" ]; then cat > /dev/null; else
-              grep --line-buffered -E "\] up |\[oom\]|\[rewind\]|parameters|Resumed|\[skip\]|\[diverged\]|Finished|Error|Traceback|Killed"; fi
+              grep --line-buffered -E "\] up |\[val\]|\[oom\]|\[rewind\]|parameters|Resumed|\[skip\]|\[diverged\]|Finished|Error|Traceback|Killed"; fi
         if [ "${PIPESTATUS[0]}" != "0" ]; then
           echo "FAILED: $m seed $s (see $log)"
         fi

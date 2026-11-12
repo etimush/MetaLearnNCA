@@ -30,9 +30,24 @@ used (CIFAR-100 train + test sets). Preprocessing: pixels scaled to [-1, 1]; no 
 **Training regime** (`cifar_lib.REGIME`, identical for all methods):
 5-way episodes, 1- or 5-shot (drawn per pass, so one model serves both test shots), 10 query
 images per class, 16 tasks per update (2 per pass × 8 passes), 4,000 updates (64,000 episodes),
-AdamW with lr 2e-3 cosine-annealed to 5e-4, weight decay 1e-5, gradient-norm clip 1.0, bf16
-autocast where supported (fp32 otherwise). Same NaN/roll-back guards and out-of-memory fallback
-as the Omniglot ablations.
+AdamW with lr 1e-3 cosine-annealed to 2.5e-4, weight decay 1e-5, gradient-norm clip 1.0, bf16
+autocast where supported (fp32 otherwise), no augmentation.
+
+*Model selection.* Every 250 updates each run is validated on 100 + 100 fixed 1-/5-shot episodes
+from the 20 validation classes (never the test classes); `best.pt` keeps the weights with the best
+mean validation accuracy, and the test uses it (`eval_cifar.py --checkpoint final` for the last
+weights). Standard practice in few-shot learning, and it means a late collapse cannot erase a
+run that had learned.
+
+*Stability guards* (same rule for every method; counts are saved in `status.json` and should be
+reported): a pass whose loss is non-finite, or larger than both 5.0 and 10× the median of the last
+200 good passes, is skipped as an explosion. After 10 consecutive skipped updates (or non-finite
+weights) the run rolls back to its last good state (snapshot every 25 updates) and halves its
+learning rate; after 10 roll-backs it is marked diverged. Why: with lr 2e-3, MetaLearnNCA runs
+learned and then exploded late in training (losses of 10^3 to 10^16 with *finite* gradients, so the
+NaN-only guard never fired) and ended at chance; Adam moves every weight by about the learning
+rate per update regardless of gradient clipping, and the NCA iterates the same rule ~38 times,
+so small weight changes can push its dynamics into an unstable regime. Hence also the lower lr.
 
 **Test protocol** (`eval_cifar.py`): 5-way, 1-shot and 5-shot, 15 queries per class, 1,000
 episodes per shot from the 20 test classes. Episode *e* depends only on `(episode_seed, shot, e)`,

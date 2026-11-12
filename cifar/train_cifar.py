@@ -21,6 +21,7 @@ Examples
   python cifar/train_cifar.py --method protonet --seed 0 --smoke --fake_data     # CPU pipeline check
 """
 import argparse
+import collections
 import copy
 import csv
 import json
@@ -53,6 +54,8 @@ def parse_args():
     p.add_argument("--nan_patience", type=int, default=10)
     p.add_argument("--snapshot_every", type=int, default=25)
     p.add_argument("--max_rewinds", type=int, default=10)
+    p.add_argument("--val_every", type=int, default=C.REGIME["val_every"], help="0 disables validation")
+    p.add_argument("--val_episodes", type=int, default=C.REGIME["val_episodes"])
     p.add_argument("--resume", action="store_true")
     p.add_argument("--overwrite", action="store_true")
     p.add_argument("--fake_data", action="store_true", help="synthetic textures instead of CIFAR-100")
@@ -77,6 +80,7 @@ def main():
     if args.smoke:
         updates, micro, accum = 4, 1, 2
         args.log_every, args.ckpt_every = 1, 2
+        args.val_every, args.val_episodes = 2, 4
 
     run_dir = os.path.join(args.out_dir, args.method, f"seed{args.seed}")
     os.makedirs(run_dir, exist_ok=True)
@@ -127,11 +131,42 @@ def main():
     print(f"{args.method} seed {args.seed}: {n_params:,} parameters (target {target:,}) | train bank "
           f"{tuple(bank.shape)} | {updates} updates x {micro * accum} tasks | amp {amp_dtype}", flush=True)
 
+    # fixed validation episodes (validation classes = disjoint superclasses; never the test classes)
+    val_sets = {}
+    if args.val_every > 0:
+        for shot in R["test_shots"]:
+            val_sets[shot] = C.fixed_episodes(banks["val"], args.val_episodes, R["n_way"], shot, R["test_query"],
+                                              seed=R["episode_seed"] + 1)
+
+    def validate():
+        """Mean accuracy on the validation episodes; leaves the training random streams untouched."""
+        rng = (random.getstate(), np.random.get_state(), torch.get_rng_state(),
+               torch.cuda.get_rng_state(device) if device.type == "cuda" else None)
+        learner.eval()
+        out = {}
+        for shot, (sx, sy, qx, qy) in val_sets.items():
+            hits = []
+            for i in range(0, sx.shape[0], 8):
+                torch.manual_seed(12345 + i)
+                sc = learner.predict(sx[i:i + 8].to(device), sy[i:i + 8].to(device), qx[i:i + 8].to(device))
+                hits.append((sc.argmax(-1).cpu() == qy[i:i + 8]).float().mean(1))
+            out[shot] = 100.0 * torch.cat(hits).mean().item()
+        learner.train()
+        random.setstate(rng[0]); np.random.set_state(rng[1]); torch.set_rng_state(rng[2])
+        if rng[3] is not None:
+            torch.cuda.set_rng_state(rng[3], device)
+        return out
+
     params = [p for p in learner.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(params, lr=R["lr"], weight_decay=R["weight_decay"])
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=updates, eta_min=R["lr_min"])
 
     start, skipped_steps, skipped_passes = 1, 0, 0
+    lr_scale, best_val, best_update, spike_skips = 1.0, -1.0, None, 0
+    val_log = os.path.join(run_dir, "val_log.csv")
+    if not (args.resume and os.path.exists(os.path.join(run_dir, "latest.pt"))) and args.val_every > 0:
+        with open(val_log, "w", newline="") as f:
+            csv.writer(f).writerow(["update"] + [f"val_{s}shot" for s in R["test_shots"]] + ["mean", "best"])
     latest_path = os.path.join(run_dir, "latest.pt")
     log_path = os.path.join(run_dir, "train_log.csv")
     header = ["update", "loss", "acc", "lr", "grad_norm", "sec_per_update", "skipped_steps", "skipped_passes",
@@ -143,6 +178,8 @@ def main():
         scheduler.load_state_dict(ck["scheduler"])
         start = ck["update"] + 1
         skipped_steps, skipped_passes = ck.get("skipped_steps", 0), ck.get("skipped_passes", 0)
+        lr_scale, best_val = ck.get("lr_scale", 1.0), ck.get("best_val", -1.0)
+        best_update, spike_skips = ck.get("best_update", None), ck.get("spike_skips", 0)
         random.setstate(ck["rng"]["python"]); np.random.set_state(ck["rng"]["numpy"])
         torch.set_rng_state(ck["rng"]["torch"].cpu())
         if device.type == "cuda" and ck["rng"].get("cuda") is not None:
@@ -158,7 +195,9 @@ def main():
 
     def state():
         return copy.deepcopy(dict(model=learner.state_dict(), optimizer=optimizer.state_dict(),
-                                  scheduler=scheduler.state_dict()))
+                                  scheduler=scheduler.state_dict(), lr_scale=lr_scale))
+
+    recent = collections.deque(maxlen=R["spike_window"])     # losses of recent good passes
 
     snapshot, snapshot_update = state(), start - 1
     rewinds, oom_fallbacks, bad_streak, status = [], [], 0, "ok"
@@ -178,10 +217,15 @@ def main():
                     with C.amp_context(device, amp_dtype):
                         loss, acc = learner.train_loss(*batch)
                     lv, av = torch.stack([loss.detach().float(), acc.float()]).tolist()
-                    if not math.isfinite(lv):
+                    spike = (len(recent) >= 50 and lv > R["spike_floor"]
+                             and lv > R["spike_factor"] * float(np.median(recent)))
+                    if not math.isfinite(lv) or spike:
+                        # skip this pass: a non-finite or exploded loss would wreck the update
                         bad += 1
+                        spike_skips += int(spike)
                         continue
                     (loss / accum).backward()
+                    recent.append(lv)
                     loss_sum, acc_sum, good = loss_sum + lv, acc_sum + av, good + 1
             except torch.cuda.OutOfMemoryError:
                 oom = True
@@ -218,12 +262,21 @@ def main():
             learner.load_state_dict(snapshot["model"])
             optimizer.load_state_dict(snapshot["optimizer"])
             scheduler.load_state_dict(snapshot["scheduler"])
-            rewinds.append(dict(at_update=u, back_to=snapshot_update,
+            # halve the learning rate (relative to the snapshot's own scale) for the rest of the run
+            new_scale = lr_scale * R["rewind_lr_factor"]
+            ratio = new_scale / snapshot["lr_scale"]
+            for g in optimizer.param_groups:
+                g["lr"] *= ratio
+            scheduler.base_lrs = [b * ratio for b in scheduler.base_lrs]
+            scheduler.eta_min *= ratio
+            lr_scale = new_scale
+            recent.clear()
+            rewinds.append(dict(at_update=u, back_to=snapshot_update, lr_scale=lr_scale,
                                 reason="non-finite weights" if not weights_ok else f"{bad_streak} skipped updates"))
             reseed = args.seed * 1000 + len(rewinds)
             random.seed(reseed); np.random.seed(reseed); torch.manual_seed(reseed)
             print(f"[rewind] {args.method} seed {args.seed}: {rewinds[-1]['reason']} at update {u}; back to "
-                  f"{snapshot_update} ({len(rewinds)}/{args.max_rewinds})", flush=True)
+                  f"{snapshot_update}, learning rate x{lr_scale:g} ({len(rewinds)}/{args.max_rewinds})", flush=True)
             bad_streak, u = 0, snapshot_update + 1
             continue
         if stepped and u % args.snapshot_every == 0:
@@ -242,10 +295,27 @@ def main():
             print(f"[{args.method} s{args.seed}] up {u:5d}/{updates} | loss {row[1]:.4f} | acc {row[2]:5.1f}% | "
                   f"gn {row[4]:.3f} | {sec:.2f}s/up | ETA {eta:.0f} min{extra}", flush=True)
 
+        if args.val_every > 0 and stepped and (u % args.val_every == 0 or u == updates):
+            va = validate()
+            score = float(np.mean(list(va.values())))
+            improved = score > best_val
+            if improved:
+                best_val, best_update = score, u
+                best_path = os.path.join(run_dir, "best.pt")
+                torch.save(dict(method=args.method, size=list(size), n_way=R["n_way"], n_params=n_params,
+                                update=u, val=va, state_dict={k: v.detach().cpu() for k, v in
+                                                              learner.state_dict().items()}), best_path + ".tmp")
+                os.replace(best_path + ".tmp", best_path)
+            with open(val_log, "a", newline="") as f:
+                csv.writer(f).writerow([u] + [f"{va[s]:.2f}" for s in R["test_shots"]] + [f"{score:.2f}", int(improved)])
+            print(f"[val] {args.method} s{args.seed} up {u}: " + ", ".join(f"{s}-shot {va[s]:.1f}%" for s in va)
+                  + f" | best {best_val:.1f}% @ {best_update}" + (" (new best)" if improved else ""), flush=True)
+
         if stepped and u % args.ckpt_every == 0:
             torch.save(dict(model=learner.state_dict(), optimizer=optimizer.state_dict(),
                             scheduler=scheduler.state_dict(), update=u, skipped_steps=skipped_steps,
-                            skipped_passes=skipped_passes,
+                            skipped_passes=skipped_passes, lr_scale=lr_scale, best_val=best_val,
+                            best_update=best_update, spike_skips=spike_skips,
                             rng=dict(python=random.getstate(), numpy=np.random.get_state(),
                                      torch=torch.get_rng_state(),
                                      cuda=torch.cuda.get_rng_state(device) if device.type == "cuda" else None)),
@@ -265,6 +335,8 @@ def main():
     with open(status_path + ".tmp", "w") as f:
         json.dump(dict(status=status, updates_completed=u, updates_planned=updates, wall_time_s=time.time() - t0,
                        skipped_steps=skipped_steps, skipped_passes=skipped_passes, rewinds=rewinds,
+                       spike_skips=spike_skips, lr_scale_final=lr_scale, best_update=best_update,
+                       best_val=best_val,
                        oom_fallbacks=oom_fallbacks, amp=str(amp_dtype), peak_train_mem_mb=peak,
                        n_params=n_params), f, indent=2)
     os.replace(status_path + ".tmp", status_path)
@@ -272,9 +344,13 @@ def main():
           f"({(time.time() - t0) / 60:.1f} min) -> {run_dir}", flush=True)
 
 
-def load_model(run_dir, device="cpu"):
-    """Rebuild a trained learner from <run_dir>/model.pt."""
-    ck = torch.load(os.path.join(run_dir, "model.pt"), map_location="cpu", weights_only=False)
+def load_model(run_dir, device="cpu", which="best"):
+    """Rebuild a trained learner from <run_dir>/best.pt (best validation accuracy) or model.pt (final)."""
+    path = os.path.join(run_dir, "best.pt")
+    if which != "best" or not os.path.exists(path):
+        path = os.path.join(run_dir, "model.pt")
+    ck = torch.load(path, map_location="cpu", weights_only=False)
+    ck["checkpoint_file"] = os.path.basename(path)
     learner = C.build_learner(ck["method"], ck["n_way"], tuple(ck["size"]))
     learner.load_state_dict(ck["state_dict"])
     return learner.to(device).eval(), ck

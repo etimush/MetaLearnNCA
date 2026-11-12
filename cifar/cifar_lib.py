@@ -43,9 +43,15 @@ REGIME = dict(
     updates=4000,
     tasks_per_update=16,
     micro_batch=2,             # tasks per forward pass (2 x 8 passes = 16 tasks per update)
-    lr=2e-3, lr_min=5e-4,      # AdamW, cosine annealing
+    lr=1e-3, lr_min=2.5e-4,    # AdamW, cosine annealing (2e-3 made the NCA dynamics explode late in training)
     weight_decay=1e-5,
     grad_clip=1.0,
+    val_every=250,             # model selection: validate on the 20 VALIDATION classes every 250 updates,
+    val_episodes=100,          #   100 episodes per shot; the test uses the checkpoint with the best mean
+    spike_factor=10.0,         # a pass whose loss exceeds 10x the median of the last 200 good passes
+    spike_floor=5.0,           #   (and 5.0) is skipped as an explosion; repeated skips trigger a roll-back
+    spike_window=200,
+    rewind_lr_factor=0.5,      # every roll-back halves the learning rate (same rule for every method)
     test_shots=(1, 5),
     test_query=15,             # standard: 15 queries per class
     test_episodes=1000,
