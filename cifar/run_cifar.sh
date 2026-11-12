@@ -15,6 +15,7 @@
 #   EXTRA         extra flags passed to every train_cifar.py call
 #   RUN_EVAL      default: 1   (evaluate + build the table when training is done)
 #   QUIET         1 = do not echo progress lines (they are always in $OUT/logs/)
+#   RESULTS       default: cifar_results (folder for the evaluation table)
 #
 # Jobs are ordered seed-major, every job uses --resume (re-running continues interrupted runs and
 # skips finished ones), and Ctrl-C stops all workers and their training processes.
@@ -29,6 +30,7 @@ OUT=${OUT:-cifar_runs}
 EXTRA=${EXTRA:-}
 RUN_EVAL=${RUN_EVAL:-1}
 QUIET=${QUIET:-0}
+RESULTS=${RESULTS:-cifar_results}
 LOGDIR="$OUT/logs"
 mkdir -p "$LOGDIR"
 
@@ -90,6 +92,6 @@ for f in "$OUT"/*/seed*/status.json; do
 done
 
 if [ "$RUN_EVAL" = "1" ]; then
-  CUDA_VISIBLE_DEVICES=${gpu_arr[0]} python cifar/eval_cifar.py --runs_dir "$OUT" --out_dir cifar_results
-  echo "Table: cifar_results/table.md and cifar_results/table.tex"
+  CUDA_VISIBLE_DEVICES=${gpu_arr[0]} python cifar/eval_cifar.py --runs_dir "$OUT" --out_dir "$RESULTS"
+  echo "Table: $RESULTS/table.md and $RESULTS/table.tex"
 fi
