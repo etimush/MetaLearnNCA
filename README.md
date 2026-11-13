@@ -143,6 +143,16 @@ python Train-Canonical-Models.py \
 ```
 *Datasets are decoded once and cached as tensors in `./data/ablation_cache/` (training episodes are sampled on the GPU; FOMAML picks the faster of two equivalent implementations at start-up). Evaluation tasks are fixed by the evaluation seeds (43–52), identical to `ML-NCA-Testing.py`. Per-task results go to `baseline_results/results_raw.csv` (finished model/seed pairs are skipped on re-runs); trained models to `baseline_results/checkpoints/`.*
 
+**Same training regime as the released MetaLearnNCA checkpoints.** `--nca_regime` trains the baselines exactly like `ML-NCA-Faster-trainign.py`: 4,000 updates of 16 tasks (64,000 episodes), AdamW lr 2e-3 cosine-annealed to 5e-4, weight decay 1e-5, gradient clip 1.0, the same 10-way 1-shot 5-query training episodes. Results go to `baseline_results_nca_regime/`, so they never mix with the default runs (32 tasks × 5,000 updates, constant lr 1e-3):
+
+```bash
+python Train-Canonical-Models.py --nca_regime --shots 1 5 10 --test_runs 10 --seeds 0 1 2 3 4 \
+    --models MAML ProtoNet MatchingNet RelationNet
+python ablations/make_table1.py --baseline_csv baseline_results_nca_regime/results_raw.csv \
+    --nca_csv ablation_results/results_raw.csv --out_dir table1_nca_regime
+```
+*Each setting can still be overridden (`--epochs`, `--meta_batch`, `--lr`, `--lr_min`, `--weight_decay`). The lr, schedule and weight decay are recorded in every results row; `make_table1.py` keeps only the latest regime per model if a file holds several.*
+
 ### 4. Multi-seed Table 1 (baselines + MetaLearnNCA, mean ± SD over training seeds)
 
 ```bash

@@ -323,9 +323,13 @@ def choose_maml_mode(model, omni_bank, meta_batch_size, trials=3):
 
 
 def train_model(model_name, omni_bank, meta_epochs=1500, meta_batch_size=32, matching_scale=100.0,
-                maml_mode="auto"):
+                maml_mode="auto", lr=1e-3, lr_min=None, weight_decay=1e-5):
+    """lr_min=None: constant learning rate; otherwise cosine-annealed from lr to lr_min over
+    meta_epochs, stepped once per update (as in ML-NCA-Faster-trainign.py)."""
     print(f"\n=======================================================")
-    print(f" TRAINING BASELINE: {model_name} (Meta-Batch Size: {meta_batch_size})")
+    sched_str = f"cosine {lr:g} -> {lr_min:g}" if lr_min is not None else f"constant {lr:g}"
+    print(f" TRAINING BASELINE: {model_name} (Meta-Batch Size: {meta_batch_size}, "
+          f"{meta_epochs} updates, lr {sched_str})")
     print(f"=======================================================")
 
     if model_name == "ProtoNet":
@@ -339,7 +343,9 @@ def train_model(model_name, omni_bank, meta_epochs=1500, meta_batch_size=32, mat
     else:
         raise ValueError(f"Unknown model '{model_name}' (choose from ProtoNet MatchingNet RelationNet MAML)")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = (torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=meta_epochs, eta_min=lr_min)
+                 if lr_min is not None else None)
     model.train()
     use_vmap = False
     if model_name == "MAML":
@@ -374,9 +380,12 @@ def train_model(model_name, omni_bank, meta_epochs=1500, meta_batch_size=32, mat
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
 
         if epoch % 50 == 0:
-            pbar.set_postfix({"MetaLoss": f"{epoch_loss / meta_batch_size:.4f}"})
+            pbar.set_postfix({"MetaLoss": f"{epoch_loss / meta_batch_size:.4f}",
+                              "lr": f"{optimizer.param_groups[0]['lr']:.2e}"})
 
     return model
 
@@ -536,8 +545,21 @@ def print_summary_tables(results, datasets, shots, models):
 # ==========================================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train and Evaluate Meta-Learning Baselines aligned with MetaNCA.")
-    parser.add_argument("--epochs", type=int, default=5000, help="Meta-epochs on Omniglot (default: 5000)")
-    parser.add_argument("--meta_batch", type=int, default=32, help="Meta-batch size (default: 32)")
+    parser.add_argument("--nca_regime", action="store_true",
+                        help="Train with the regime of the released MetaLearnNCA checkpoints "
+                             "(ML-NCA-Faster-trainign.py): 4000 updates of 16 tasks, AdamW lr 2e-3 "
+                             "cosine-annealed to 5e-4. Sets the defaults of --epochs, --meta_batch, --lr, "
+                             "--lr_min and --results_dir (explicit values still win).")
+    parser.add_argument("--epochs", type=int, default=None,
+                        help="Meta-updates on Omniglot (default: 5000; 4000 with --nca_regime)")
+    parser.add_argument("--meta_batch", type=int, default=None,
+                        help="Tasks per update (default: 32; 16 with --nca_regime)")
+    parser.add_argument("--lr", type=float, default=None,
+                        help="AdamW learning rate (default: 1e-3; 2e-3 with --nca_regime)")
+    parser.add_argument("--lr_min", type=float, default=None,
+                        help="Cosine-anneal the lr to this value over training; unset = constant lr "
+                             "(default: constant; 5e-4 with --nca_regime)")
+    parser.add_argument("--weight_decay", type=float, default=1e-5, help="AdamW weight decay (default: 1e-5)")
     parser.add_argument("--shots", nargs="+", type=int, default=[1, 5, 10],
                         help="Support shot counts to test (e.g. --shots 1 5 10)")
     parser.add_argument("--test_runs", type=int, default=10,
@@ -557,27 +579,53 @@ if __name__ == "__main__":
     parser.add_argument("--seeds", nargs="+", type=int, default=None,
                         help="Several training seeds (overrides --seed), e.g. --seeds 0 1 2 3 4")
     parser.add_argument("--datasets", nargs="+", default=["omniglot", "mnist", "fashion", "kmnist", "usps", "medmnist"])
-    parser.add_argument("--results_dir", default="baseline_results",
+    parser.add_argument("--results_dir", default=None,
                         help="Per-task results are appended to <results_dir>/results_raw.csv and trained "
                              "models saved to <results_dir>/checkpoints/. Combine seeds with "
-                             "ablations/make_table1.py.")
+                             "ablations/make_table1.py. Default: baseline_results, or "
+                             "baseline_results_nca_regime with --nca_regime.")
     parser.add_argument("--maml_mode", choices=["auto", "vmap", "loop"], default="auto",
                         help="FOMAML training: all tasks in one vmapped call, or the per-task loop. Same "
                              "meta-gradient; 'auto' times both at start-up and uses the faster one.")
     parser.add_argument("--no_skip", action="store_true",
                         help="Retrain (model, seed) pairs whose results are already in results_raw.csv")
     args = parser.parse_args()
+    regime_defaults = (dict(epochs=4000, meta_batch=16, lr=2e-3, lr_min=5e-4,
+                            results_dir="baseline_results_nca_regime") if args.nca_regime else
+                       dict(epochs=5000, meta_batch=32, lr=1e-3, lr_min=None, results_dir="baseline_results"))
+    for k, v in regime_defaults.items():
+        if getattr(args, k) is None:
+            setattr(args, k, v)
+    lr_schedule = f"cosine_to_{args.lr_min:g}" if args.lr_min is not None else "constant"
+    print(f"Training regime: {args.epochs} updates x {args.meta_batch} tasks, AdamW lr {args.lr:g} "
+          f"({lr_schedule}), weight decay {args.weight_decay:g}, grad clip 1.0 -> {args.results_dir}/")
     seeds = args.seeds if args.seeds else [args.seed]
 
     os.makedirs("./data", exist_ok=True)
     os.makedirs(os.path.join(args.results_dir, "checkpoints"), exist_ok=True)
     raw_path = os.path.join(args.results_dir, "results_raw.csv")
     raw_fields = ["model", "train_seed", "dataset", "shot", "eval_seed", "acc", "time_s", "n_params",
-                  "epochs", "meta_batch", "matching_scale"]
+                  "epochs", "meta_batch", "matching_scale", "lr", "lr_schedule", "weight_decay"]
+    legacy_fields = raw_fields[:11]   # files written before the lr columns existed
+
+    if os.path.exists(raw_path):
+        with open(raw_path) as f:
+            header = next(csv.reader(f), None)
+        if header == legacy_fields:
+            # Older file: every row in it used AdamW 1e-3 constant, wd 1e-5. Appending rows of another
+            # regime would make them indistinguishable from the old ones.
+            if (args.lr, args.lr_min, args.weight_decay) != (1e-3, None, 1e-5):
+                sys.exit(f"{raw_path} predates the lr columns (all its rows used lr 1e-3 constant, "
+                         f"wd 1e-5). Use another --results_dir for lr {args.lr:g} ({lr_schedule}).")
+            raw_fields = legacy_fields
+        elif header is not None and header != raw_fields:
+            sys.exit(f"{raw_path} has an unexpected header {header}; use another --results_dir.")
 
     def config_of(model_name):
-        return dict(epochs=str(args.epochs), meta_batch=str(args.meta_batch),
-                    matching_scale=str(args.matching_scale) if model_name == "MatchingNet" else "")
+        cfg = dict(epochs=str(args.epochs), meta_batch=str(args.meta_batch),
+                   matching_scale=str(args.matching_scale) if model_name == "MatchingNet" else "",
+                   lr=f"{args.lr:g}", lr_schedule=lr_schedule, weight_decay=f"{args.weight_decay:g}")
+        return {k: v for k, v in cfg.items() if k in raw_fields}
 
     def already_done(model_name, seed):
         if args.no_skip or not os.path.exists(raw_path):
@@ -613,7 +661,8 @@ if __name__ == "__main__":
             set_determinism(seed)
             trained_model = train_model(
                 model_name, omni_train_bank, meta_epochs=args.epochs, meta_batch_size=args.meta_batch,
-                matching_scale=args.matching_scale, maml_mode=args.maml_mode
+                matching_scale=args.matching_scale, maml_mode=args.maml_mode,
+                lr=args.lr, lr_min=args.lr_min, weight_decay=args.weight_decay
             )
             trained_model.eval()
             n_params = sum(p.numel() for p in trained_model.parameters())

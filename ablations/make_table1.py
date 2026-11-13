@@ -63,6 +63,16 @@ def parse_args():
     return p.parse_args()
 
 
+# Columns that identify a baseline training regime. Files written before the lr columns existed
+# all used AdamW lr 1e-3 constant with weight decay 1e-5.
+CONFIG_COLS = ("epochs", "meta_batch", "matching_scale", "lr", "lr_schedule", "weight_decay")
+LEGACY_DEFAULTS = {"lr": "0.001", "lr_schedule": "constant", "weight_decay": "1e-05"}
+
+
+def config_key(r):
+    return tuple(r.get(c) if r.get(c) is not None else LEGACY_DEFAULTS.get(c, "") for c in CONFIG_COLS)
+
+
 def load_baselines(paths):
     """{(method, seed, dataset, shot): {eval_seed: acc}}, params {method: n}."""
     scores, params, configs = defaultdict(dict), {}, defaultdict(list)
@@ -72,18 +82,18 @@ def load_baselines(paths):
             rows += list(csv.DictReader(open(path)))
         else:
             print(f"[warn] no baseline results at {path}")
-    # if a model was run with several settings (e.g. epochs, matching_scale), keep the latest
+    # if a model was run with several settings (e.g. epochs, matching_scale, lr), keep the latest
     for r in rows:
-        cfg = (r["epochs"], r["meta_batch"], r["matching_scale"])
+        cfg = config_key(r)
         if cfg not in configs[r["model"]]:
             configs[r["model"]].append(cfg)
     latest = {m: c[-1] for m, c in configs.items()}
     for m, c in configs.items():
         if len(c) > 1:
-            print(f"[warn] {m} was run with several settings (epochs, meta_batch, matching_scale) = {c}; "
+            print(f"[warn] {m} was run with several settings {CONFIG_COLS} = {c}; "
                   f"using the latest {latest[m]}")
     for r in rows:
-        if (r["epochs"], r["meta_batch"], r["matching_scale"]) != latest[r["model"]]:
+        if config_key(r) != latest[r["model"]]:
             continue
         key = (r["model"], r["train_seed"], r["dataset"], int(r["shot"]))
         scores[key][r["eval_seed"]] = float(r["acc"])   # duplicates: last row wins
