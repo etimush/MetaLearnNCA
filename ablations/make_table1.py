@@ -56,6 +56,10 @@ def parse_args():
     p.add_argument("--allow_subsampled", action="store_true",
                    help="also use eval_ablation rows run with --max_test_per_class (quick looks only)")
     p.add_argument("--out_dir", default="table1")
+    p.add_argument("--baselines_only", action="store_true", help="ignore MetaLearnNCA results (baseline table)")
+    p.add_argument("--decimals", type=int, default=1, help="decimals in the LaTeX table (default 1)")
+    p.add_argument("--print", dest="print_fmt", choices=["latex", "md", "both"], default="latex",
+                   help="what to print to the terminal (all formats are always written to --out_dir)")
     return p.parse_args()
 
 
@@ -110,7 +114,10 @@ def load_nca(path, models, allow_subsampled):
 def main():
     args = parse_args()
     b_scores, b_params = load_baselines(args.baseline_csv)
-    n_scores, n_params = load_nca(args.nca_csv, args.nca_models, args.allow_subsampled)
+    if args.baselines_only:
+        n_scores, n_params = {}, {}
+    else:
+        n_scores, n_params = load_nca(args.nca_csv, args.nca_models, args.allow_subsampled)
     scores = {**b_scores, **n_scores}
     params = {**b_params, **n_params}
 
@@ -157,7 +164,8 @@ def main():
                 bold = m == best
                 txt = f"{st['mean']:.2f} ± {pm:.2f}" if st["n"] > 1 else f"{st['mean']:.2f} (1 seed)"
                 cells_md[(d, shot, m)] = f"**{txt}**" if bold else txt
-                tex = f"{st['mean']:.2f}" + (f"_{{\\pm {pm:.2f}}}" if st["n"] > 1 else "")
+                dp = args.decimals
+                tex = f"{st['mean']:.{dp}f}" + (f"_{{\\pm {pm:.{dp}f}}}" if st["n"] > 1 else "")
                 cells_tex[(d, shot, m)] = f"$\\mathbf{{{tex}}}$" if bold else f"${tex}$"
                 summary.append(dict(dataset=d, shot=shot, method=lab, mean=round(st["mean"], 3),
                                     sd=round(st["sd"], 3), ci95=round(st["ci"], 3), n_seeds=st["n"],
@@ -213,31 +221,50 @@ def main():
     with open(os.path.join(args.out_dir, "table1.md"), "w") as f:
         f.write("\n".join(md) + "\n")
 
-    # ---------------- LaTeX ----------------
+    # ---------------- LaTeX (sized for a single-column ICLR page) ----------------
     pm_tex = "SD" if args.stat == "sd" else r"95\% CI"
     n_tasks = {len(v) for v in scores.values()}
-    task_txt = (f"the same {n_tasks.pop()} evaluation tasks for every method" if len(n_tasks) == 1 and not mismatched
-                else "its evaluation tasks")
-    tex = [r"\begin{table}[t]", r"\centering", r"\small", r"\setlength{\tabcolsep}{3pt}",
-           r"\begin{tabular}{ll" + "c" * len(methods) + "}", r"\toprule",
-           "Dataset & Shot & " + " & ".join(labels) + r" \\", r"\midrule"]
-    for di, d in enumerate(datasets):
+    task_txt = (f"the same {n_tasks.pop()} test tasks for every method" if len(n_tasks) == 1 and not mismatched
+                else "its test tasks")
+    seeds_txt = ", ".join(f"{lab}: {max((s['n_seeds'] for s in summary if s['method'] == lab), default=0)}"
+                          for _, lab in methods)
+    short = {"MetaLearnNCA (orig. ckpts)": r"\shortstack{MetaLearnNCA\\(orig.\ ckpts)}"}
+    groups = [("Gradient-free baselines", [m for m in ("MatchingNet", "RelationNet", "ProtoNet") if m in params]),
+              ("Gradient-based", [m for m in ("MAML",) if m in params]),
+              ("Ours", [m for m in args.nca_models if m in params])]
+    tex = [r"\begin{table}[t]", r"\centering", r"\footnotesize", r"\setlength{\tabcolsep}{3pt}",
+           r"\begin{tabular}{@{}ll" + "c" * len(methods) + "@{}}", r"\toprule"]
+    head, rules, col = [" ", " "], [], 3
+    for name, ms in groups:
+        if ms:
+            head.append(rf"\multicolumn{{{len(ms)}}}{{c}}{{{name}}}")
+            rules.append(rf"\cmidrule(lr){{{col}-{col + len(ms) - 1}}}")
+            col += len(ms)
+    tex += [" & ".join(head) + r" \\", "".join(rules),
+            "Dataset & Shot & " + " & ".join(short.get(lab, lab) for lab in labels) + r" \\", r"\midrule"]
+    for d in datasets:
         for i, shot in enumerate(args.shots):
-            name = L.DATASET_LABELS.get(d, d) + (" (in-dist.)" if d == "omniglot" else "")
+            name = L.DATASET_LABELS.get(d, d) + (" (ID)" if d == "omniglot" else "")
             tex.append((name if i == 0 else "") + f" & {shot} & " +
                        " & ".join(cells_tex.get((d, shot, m), "--") for m, _ in methods) + r" \\")
         tex.append(r"\midrule")
-    tex.append(r"Test-time gradients? & & " + " & ".join(TEST_TIME_GRADS.get(m, "?") for m, _ in methods) + r" \\")
-    tex.append(r"Parameters & & " + " & ".join(f"$\\approx {params[m] / 1000:.0f}$k" for m, _ in methods) + r" \\")
+    tex.append(r"\multicolumn{2}{@{}l}{Test-time gradients} & " +
+               " & ".join(TEST_TIME_GRADS.get(m, "?") for m, _ in methods) + r" \\")
+    tex.append(r"\multicolumn{2}{@{}l}{Parameters} & " +
+               " & ".join(f"{params[m] / 1000:.0f}k" for m, _ in methods) + r" \\")
     tex += [r"\bottomrule", r"\end{tabular}",
-            r"\caption{Few-shot accuracy (\%, 10-way), mean$\pm$" + pm_tex + " "
-            r"across training seeds (each seed averaged over " + task_txt + "). "
-            r"Bold: best mean per row.}", r"\label{tab:main_results}", r"\end{table}"]
+            r"\caption{10-way few-shot accuracy (\%) on Omniglot (in-distribution, ID) and on out-of-distribution "
+            r"datasets, mean$\pm$" + pm_tex + " across training seeds (" + seeds_txt + "); each seed is averaged "
+            r"over " + task_txt + ". Bold: best mean per row.}",
+            r"\label{tab:main_results}", r"\end{table}"]
     with open(os.path.join(args.out_dir, "table1.tex"), "w") as f:
         f.write("\n".join(tex) + "\n")
 
-    print("\n".join(md))
-    print(f"\nWrote {args.out_dir}/table1.md, table1.tex, table1_summary.csv")
+    if args.print_fmt in ("md", "both"):
+        print("\n".join(md))
+    if args.print_fmt in ("latex", "both"):
+        print("\n".join(tex))
+    print(f"\n% Wrote {args.out_dir}/table1.md, table1.tex, table1_summary.csv")
 
 
 if __name__ == "__main__":

@@ -148,6 +148,7 @@ python Train-Canonical-Models.py \
 ```bash
 python ablations/make_table1.py --baseline_csv baseline_results/results_raw.csv --nca_csv ablation_results/results_raw.csv
 ```
+*Prints paper-ready LaTeX (`--print md` for Markdown, `--decimals 2` for two decimals, `--baselines_only` for a table of the baselines alone).*
 *MetaLearnNCA rows come from `ablations/eval_ablation.py` (`full` = retrained, `full_original` = `checkpoints/`). Writes `table1/table1.md`, `table1.tex`, `table1_summary.csv`.*
 
 ---
