@@ -2,6 +2,7 @@
 
 Usage (from the repository root):
   python paper_figures/fig1/run_loop.py 0 43 paper_figures/fig1/loop_s0.npz   # checkpoint seed, eval seed
+  python paper_figures/fig1/pick_query.py <loop.npz> <loop_q.npz> 0 43 omniglot          # optional
   python paper_figures/fig1/make_fig1.py paper_figures/fig1/loop_s0.npz paper_figures/fig1/fig1_loop [5,23]
 The optional last argument lists the program channels shown (default: 5,23).
 Writes <out>.pdf (vector, fonts embedded, for the paper) and <out>.png (preview).
@@ -210,17 +211,25 @@ bax_w = SPLIT - 0.10 - bax_x
 arrow((xq + s + 0.03, yB + s / 2), (bax_x - 0.05, yB + s / 2))
 label((xq + s + bax_x) / 2 - 0.01, yB + s / 2 - 0.04, "masked\nmean", fontsize=6.0)
 bax = fig.add_axes([bax_x / W, (yB + 0.02) / H, bax_w / W, (s + 0.02) / H])
-bax.bar(range(10), pr, color=[TAB[c] for c in range(10)], width=0.75)
-bax.set_xticks(range(10)); bax.set_xticklabels([str(c) for c in range(10)], fontsize=5.3)
+# bar order: task classes 0..9, or the dataset's class ids in increasing order when given (--digits);
+# each bar keeps the colour of its task class, as in the pixel-vote maps
+if "tick_labels" in z:
+    names = [str(t) for t in z["tick_labels"]]
+    order = sorted(range(10), key=lambda c: int(names[c]) if names[c].isdigit() else names[c])
+else:
+    names, order = [str(c) for c in range(10)], list(range(10))
+bax.bar(range(10), pr[order], color=[TAB[c] for c in order], width=0.75)
+bax.set_xticks(range(10)); bax.set_xticklabels([names[c] for c in order], fontsize=5.3)
 bax.tick_params(axis="x", length=0, pad=1); bax.set_yticks([])
 for sp in ["top", "right", "left"]:
     bax.spines[sp].set_visible(False)
 bax.spines["bottom"].set_linewidth(0.5)
 bax.set_facecolor(PANEL); bax.patch.set_alpha(0)
 bax.set_ylim(0, 1.05); bax.set_xlim(-0.6, 9.6)
-qy = int(z["qy"])
-bax.annotate(r"$\hat{y}$", (qy + 0.4, 0.97), xytext=(qy + 1.6, 0.97), fontsize=7, va="center",
-             arrowprops=dict(arrowstyle="-", lw=0.5, color=GREY))
+yhat = int(np.argmax(pr))
+xh = order.index(yhat)
+bax.annotate(r"$\hat{y}$", (xh + 0.45, pr[yhat] * 0.97), xytext=(xh + 1.6, pr[yhat] * 0.97), fontsize=7,
+             va="center", arrowprops=dict(arrowstyle="-", lw=0.5, color=GREY))
 label(bax_x + bax_w / 2, yB - 0.12, "class scores", fontsize=6.3)
 
 # ---------------- (c) over the rounds ----------------

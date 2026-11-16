@@ -50,5 +50,6 @@ with torch.no_grad():
 np.savez(out, sx=sx.numpy(), sy=sy.numpy(), mask=mask.numpy(), S=np.stack(rec["S"]),
          P=np.stack(rec["P"]), E=np.stack(rec["E"]), acc=np.array(rec["acc"]),
          qx=qx.numpy(), qy=int(ty[qi]), qlog=qlog.numpy(), qprob=F.softmax(qlog, 1).numpy(),
-         qscore=qscore.numpy(), qlog_k=qlog_k, qmask=learner.alive_mask(qx).numpy())
+         qscore=qscore.numpy(), qlog_k=qlog_k, qmask=learner.alive_mask(qx).numpy(),
+         classes=np.array(split.classes))
 print("acc per k:", np.round(rec["acc"], 1), "| query true", int(ty[qi]), "pred", int(qscore.argmax()))
