@@ -2,7 +2,8 @@
 
 Usage (from the repository root):
   python paper_figures/fig1/run_loop.py 0 43 paper_figures/fig1/loop_s0.npz   # checkpoint seed, eval seed
-  python paper_figures/fig1/make_fig1.py paper_figures/fig1/loop_s0.npz paper_figures/fig1/fig1_loop
+  python paper_figures/fig1/make_fig1.py paper_figures/fig1/loop_s0.npz paper_figures/fig1/fig1_loop [5,13,23]
+The optional last argument lists the program channels shown (default: 5,13,23).
 Writes <out>.pdf (vector, fonts embedded, for the paper) and <out>.png (preview).
 """
 import sys
@@ -14,6 +15,8 @@ from matplotlib.patches import FancyBboxPatch, Rectangle, FancyArrowPatch
 
 z = np.load(sys.argv[1])
 out = sys.argv[2]
+# program channels shown (default: the channels discussed in Section 6.6)
+CH = [int(c) for c in sys.argv[3].split(",")] if len(sys.argv) > 3 else [5, 13, 23]
 
 plt.rcParams.update({
     "font.family": "serif", "font.serif": ["Liberation Serif"], "mathtext.fontset": "stix",
@@ -41,6 +44,15 @@ lo, hi = np.percentile((X - mu) @ Vt[:3].T, [2, 98], axis=0)
 def prog_rgb(Sk):
     Z = (Sk.reshape(24, -1).T - mu) @ Vt[:3].T
     return np.clip((Z - lo) / (hi - lo), 0, 1).reshape(28, 28, 3)
+
+
+def chan_card(x, y, Sk, c, size, lw=0.5, z=3):
+    """one program channel, diverging map centred on its own mean and scaled to its own range
+    (all channels start from the same U(0,1) noise, so a shared scale would hide early structure)"""
+    m = Sk[c]
+    ctr = m.mean()
+    v = max(np.percentile(np.abs(m - ctr), 99), 1e-6)
+    card(x, y, m, size, cmap="RdBu_r", vmin=ctr - v, vmax=ctr + v, lw=lw, z=z)
 
 
 def votes_rgb(logits, mask):
@@ -109,7 +121,7 @@ ax.add_patch(FancyBboxPatch((SPLIT + 0.03, 0.03), W - SPLIT - 0.06, 1.03,
 ax.text(0.09, 2.37, r"(a) Support adaptation: $K$ rounds, no gradients", fontsize=7.4, fontweight="bold",
         ha="left", va="top")
 ax.text(0.09, 1.01, "(b) Query inference", fontsize=7.4, fontweight="bold", ha="left", va="top")
-ax.text(SPLIT + 0.09, 1.01, r"(c) Adaptation over rounds $k$", fontsize=7.4, fontweight="bold",
+ax.text(SPLIT + 0.09, 1.01, r"(c) Program channels over rounds $k$", fontsize=7.4, fontweight="bold",
         ha="left", va="top")
 
 # ---------------- (a) adaptation loop ----------------
@@ -154,18 +166,21 @@ ax.add_patch(FancyArrowPatch((mx + bw * 0.70, by), (mx + bw * 0.32, by),
 label(mx + bw * 0.51, by - 0.19, r"state $\mathbf{D}_{\mathrm{meta}}$ kept across rounds", fontsize=6.3,
       color=ORANGE)
 
-x3 = mx + bw + 0.52
+x3 = mx + bw + 0.46
 arrow((mx + bw, cyA), (x3 - 0.02, cyA))
 label((mx + bw + x3) / 2, cyA - 0.04, "mean over\nsupport", fontsize=6.0)
-yS = cyA - s / 2
-card(x3, yS, prog_rgb(S[k_show + 1]), s)
-label(x3 + s / 2, yS - 0.04, r"$\mathbf{S}^{(k)}$")
+off = 0.045
+for i in reversed(range(len(CH))):
+    chan_card(x3 + off * i, yA + off * i, S[k_show + 1], CH[i], s, z=3 + (len(CH) - i) * 0.2)
+xS_r, yS_t = x3 + s + off * (len(CH) - 1), yA + s + off * (len(CH) - 1)
+xS_c = (x3 + xS_r) / 2
+label(x3 + s / 2 + off, yA - 0.04, r"$\mathbf{S}^{(k)}$")
 
 ytop = 2.17
-path_arrow([(x3 + s / 2, yS + s), (x3 + s / 2, ytop), (bx + bw * 0.5, ytop), (bx + bw * 0.5, by + bh)],
+path_arrow([(xS_c, yS_t), (xS_c, ytop), (bx + bw * 0.5, ytop), (bx + bw * 0.5, by + bh)],
            color=ORANGE, lw=0.9)
-ax.text(x3 + s / 2 - 0.06, ytop + 0.03,
-        r"next round $k \leftarrow k+1$, repeated $K$ times; $\mathbf{S}^{(0)} \sim \mathcal{U}(0,1)$",
+ax.text(xS_c - 0.06, ytop + 0.03,
+        r"next round $k \leftarrow k+1$, repeated $K$ times; $\mathbf{S}^{(0)}, \mathbf{D}_{\mathrm{meta}}^{(0)} \sim \mathcal{U}(0,1)$",
         ha="right", va="bottom", fontsize=6.6, color=ORANGE, zorder=6)
 ax.text(bx + bw * 0.5 + 0.04, ytop - 0.05, r"$\mathbf{S}^{(k-1)}$", ha="left", va="top", fontsize=6.8,
         zorder=6)
@@ -178,8 +193,8 @@ qbx, qby = 0.12 + s + 0.15, yB + s / 2 - bh / 2
 arrow((0.12 + s + 0.03, qby + bh / 2), (qbx, qby + bh / 2))
 box(qbx, qby, bw, bh, BLUE_F, BLUE, r"Active-NCA $f_\theta$", r"$2N$ steps")
 yfz = 1.088
-xfz = x3 + s + 0.11
-path_arrow([(x3 + s, yS + s / 2), (xfz, yS + s / 2), (xfz, yfz), (qbx + bw * 0.5, yfz),
+xfz = xS_r + 0.08
+path_arrow([(xS_r, cyA), (xfz, cyA), (xfz, yfz), (qbx + bw * 0.5, yfz),
             (qbx + bw * 0.5, qby + bh)], color=BLUE, lw=0.9)
 ax.text(qbx + bw * 0.5 + 0.30, yfz - 0.03, r"$\mathbf{S}^{(K)}$, frozen", ha="left", va="top",
         fontsize=6.8, color=BLUE, zorder=6)
@@ -210,18 +225,18 @@ label(bax_x + bax_w / 2, yB - 0.12, "class scores", fontsize=6.3)
 
 # ---------------- (c) over the rounds ----------------
 acc = z["acc"]
-ts, gap = 0.25, 0.05
-x0 = W - 0.08 - (6 * ts + 5 * gap)
-yS_c, yV_c = 0.515, 0.225
-ax.text(x0 - 0.06, yS_c + ts / 2, r"$\mathbf{S}^{(k)}$", ha="right", va="center", fontsize=7)
-ax.text(x0 - 0.06, yV_c + ts / 2, "query\nvotes", ha="right", va="center", fontsize=6.2, linespacing=0.95)
-ax.text(x0 - 0.06, 0.125, "acc.", ha="right", va="center", fontsize=6.2)
+ts, gap = 0.195, 0.085
+x0 = W - 0.10 - (6 * ts + 5 * gap)
+rows_y = [0.585, 0.37, 0.155]
+for c, yr in zip(CH, rows_y):
+    ax.text(x0 - 0.07, yr + ts / 2, rf"$\mathbf{{S}}^{{(k)}}_{{{c}}}$", ha="right", va="center", fontsize=7)
+ax.text(x0 - 0.07, 0.093, "acc.", ha="right", va="center", fontsize=6.4)
 for k in range(6):
     xk = x0 + k * (ts + gap)
-    card(xk, yS_c, prog_rgb(S[k]), ts, lw=0.4)
-    card(xk, yV_c, votes_rgb(z["qlog_k"][k], z["qmask"][0, 0]), ts, lw=0.4)
-    ax.text(xk + ts / 2, yS_c + ts + 0.025, f"$k={k}$", ha="center", va="bottom", fontsize=6.5)
-    ax.text(xk + ts / 2, 0.125, f"{acc[k]:.0f}%", ha="center", va="center", fontsize=6.5)
+    for c, yr in zip(CH, rows_y):
+        chan_card(xk, yr, S[k], c, ts, lw=0.4)
+    ax.text(xk + ts / 2, rows_y[0] + ts + 0.025, f"$k={k}$", ha="center", va="bottom", fontsize=6.5)
+    ax.text(xk + ts / 2, 0.093, f"{acc[k]:.0f}%", ha="center", va="center", fontsize=6.5)
 
 fig.savefig(out + ".pdf", dpi=600)   # dpi: resolution of the resampled 28x28 thumbnails
 fig.savefig(out + ".png", dpi=300)
