@@ -1,5 +1,5 @@
 """
-Test-time compute cost of every model (R1 Q1, R3 W3/Q1): MACs, wall-clock latency and peak
+Test-time compute cost of every model (R1 Q1, R3 W3/Q1): FLOPs, wall-clock latency and peak
 memory, split into the two test-time stages every few-shot method has:
 
   adaptation   support set -> task state, once per task
@@ -19,9 +19,11 @@ it is embedded once (the cheaper, deployable form). A start-up check verifies th
 adapt/predict gives the same scores as each baseline's forward().
 
 Measured, per model and shot (10-way tasks):
-  * MACs: matrix multiplications and convolutions (incl. the depthwise perception filters and,
-    for FOMAML / grad_on_s, the backward passes), counted by torch.utils.flop_counter;
-    element-wise ops, normalisation, pooling and softmax are not counted (standard convention).
+  * FLOPs: matrix multiplications and convolutions (incl. the depthwise perception filters and,
+    for FOMAML / grad_on_s, the backward passes), counted by torch.utils.flop_counter, with one
+    multiply-add = 2 FLOPs (so FLOPs = 2 x MACs; the same convention as calculate_conv4_flops in
+    Train-Canonical-Models.py: 19.6 MFLOPs per Conv4 image); element-wise ops, normalisation,
+    pooling and softmax are not counted (standard convention).
   * Wall-clock: median of --repeats timed runs after --warmup runs, synchronised on GPU.
   * Peak memory (GPU only): peak allocation above what was resident before the stage
     (weights + inputs), i.e. the activations / working memory of that stage.
@@ -79,7 +81,7 @@ def parse_args():
                    help="precision for every model (evaluation default: fp32)")
     p.add_argument("--literal_nca", action="store_true",
                    help="NCA without the exact static-term precomputation (the form of the original "
-                        "ML-NCA-Testing.py: same outputs, more MACs)")
+                        "ML-NCA-Testing.py: same outputs, more FLOPs)")
     p.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     p.add_argument("--latex_shot", type=int, default=None, help="shot shown in cost.tex (default: largest)")
     p.add_argument("--out_dir", default="cost_results")
@@ -178,10 +180,11 @@ def sync(device):
         torch.cuda.synchronize(device)
 
 
-def count_macs(fn):
+def count_flops(fn):
+    """FLOPs with one multiply-add = 2 FLOPs (torch.utils.flop_counter's convention)."""
     with FlopCounterMode(display=False) as fc:
         fn()
-    return fc.get_total_flops() / 2.0
+    return float(fc.get_total_flops())
 
 
 def time_ms(fn, device, repeats, warmup, budget):
@@ -280,7 +283,7 @@ def main():
                 with torch.no_grad(), L.amp_context(dev, amp_dtype):
                     return r.predict(state, qx)
 
-            a_macs, q_macs = count_macs(adapt), count_macs(query)
+            a_flops, q_flops = count_flops(adapt), count_flops(query)
             a_ms, a_n = time_ms(adapt, dev, args.repeats, args.warmup, args.time_budget)
             q_ms, q_n = time_ms(query, dev, args.repeats, args.warmup, args.time_budget)
             a_mb, q_mb = peak_mb(adapt, dev), peak_mb(query, dev)
@@ -288,15 +291,15 @@ def main():
             row = dict(model=r.name, label=LABELS.get(r.name, r.name), shot=k, n_way=args.n_way,
                        n_support=sx.shape[0], query_batch=Q, params=L.count_params(r.model),
                        test_time_grads=r.test_grads, schedule=r.schedule,
-                       adapt_gmacs=a_macs / 1e9, adapt_ms=a_ms, adapt_peak_mb=a_mb,
-                       query_mmacs_per_img=q_macs / Q / 1e6, query_ms_per_img=q_ms / Q,
+                       adapt_gflops=a_flops / 1e9, adapt_ms=a_ms, adapt_peak_mb=a_mb,
+                       query_mflops_per_img=q_flops / Q / 1e6, query_ms_per_img=q_ms / Q,
                        query_peak_mb=q_mb,
-                       task_gmacs=(a_macs + q_macs) / 1e9, task_ms=a_ms + q_ms,
+                       task_gflops=(a_flops + q_flops) / 1e9, task_ms=a_ms + q_ms,
                        timed_runs=f"{a_n}/{q_n}", device=dname, precision=precision,
                        nca_precompute=not args.literal_nca)
             rows.append(row)
-            print(f"{k:>2}-shot {row['label']:<24} adapt {sig(row['adapt_gmacs'])} GMACs "
-                  f"{sig(a_ms)} ms {sig(a_mb)} MB | query/img {sig(row['query_mmacs_per_img'])} MMACs "
+            print(f"{k:>2}-shot {row['label']:<24} adapt {sig(row['adapt_gflops'])} GFLOPs "
+                  f"{sig(a_ms)} ms {sig(a_mb)} MB | query/img {sig(row['query_mflops_per_img'])} MFLOPs "
                   f"{sig(row['query_ms_per_img'])} ms | {Q} queries: {sig(q_mb)} MB")
             del state
     write_outputs(rows, args, dname, precision)
@@ -317,11 +320,12 @@ def write_outputs(rows, args, dname, precision):
     md = [f"# Test-time cost ({args.n_way}-way)", "",
           f"Device: {dname}; precision: {precision}; query numbers per image, measured on batches of {Q}; "
           f"wall-clock = median of up to {args.repeats} runs; peak memory = working memory above "
-          "weights + inputs (GPU only). MACs count matrix multiplications and convolutions "
-          "(incl. backward passes for test-time gradients). Task = adaptation + "
+          "weights + inputs (GPU only). FLOPs count matrix multiplications and convolutions "
+          "(incl. backward passes for test-time gradients), one multiply-add = 2 FLOPs. "
+          "Task = adaptation + "
           f"{Q} query images.", ""]
-    md += ["| Shot | Model | Test-time grads | Params | Adapt GMACs | Adapt ms | Adapt MB "
-           "| Query MMACs/img | Query ms/img | Query MB (batch) | Task GMACs | Task ms |",
+    md += ["| Shot | Model | Test-time grads | Params | Adapt GFLOPs | Adapt ms | Adapt MB "
+           "| Query MFLOPs/img | Query ms/img | Query MB (batch) | Task GFLOPs | Task ms |",
            "|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for k in shots:
         for m in models:
@@ -329,15 +333,15 @@ def write_outputs(rows, args, dname, precision):
             if r is None:
                 continue
             md.append(f"| {k} | {r['label']} | {r['test_time_grads']} | {r['params']:,} | "
-                      f"{sig(r['adapt_gmacs'])} | {sig(r['adapt_ms'])} | {sig(r['adapt_peak_mb'])} | "
-                      f"{sig(r['query_mmacs_per_img'])} | {sig(r['query_ms_per_img'])} | "
-                      f"{sig(r['query_peak_mb'])} | {sig(r['task_gmacs'])} | {sig(r['task_ms'])} |")
+                      f"{sig(r['adapt_gflops'])} | {sig(r['adapt_ms'])} | {sig(r['adapt_peak_mb'])} | "
+                      f"{sig(r['query_mflops_per_img'])} | {sig(r['query_ms_per_img'])} | "
+                      f"{sig(r['query_peak_mb'])} | {sig(r['task_gflops'])} | {sig(r['task_ms'])} |")
 
     refs = [m for m in ("ProtoNet", "MAML") if m in models]
     others = [m for m in models if m not in BASELINES]
     if refs and others:
         md += ["", "## Relative cost (model / reference)", "",
-               "| Shot | Model | vs | Adapt MACs | Adapt time | Query MACs | Query time | Task MACs | Task time |",
+               "| Shot | Model | vs | Adapt FLOPs | Adapt time | Query FLOPs | Query time | Task FLOPs | Task time |",
                "|---|---|---|---|---|---|---|---|---|"]
         for k in shots:
             for m in others:
@@ -346,9 +350,9 @@ def write_outputs(rows, args, dname, precision):
                     if a is None or b is None:
                         continue
                     ratio = lambda c: sig(a[c] / b[c]) + "×" if b[c] else "–"
-                    md.append(f"| {k} | {a['label']} | {b['label']} | {ratio('adapt_gmacs')} | "
-                              f"{ratio('adapt_ms')} | {ratio('query_mmacs_per_img')} | "
-                              f"{ratio('query_ms_per_img')} | {ratio('task_gmacs')} | {ratio('task_ms')} |")
+                    md.append(f"| {k} | {a['label']} | {b['label']} | {ratio('adapt_gflops')} | "
+                              f"{ratio('adapt_ms')} | {ratio('query_mflops_per_img')} | "
+                              f"{ratio('query_ms_per_img')} | {ratio('task_gflops')} | {ratio('task_ms')} |")
     open(os.path.join(out, "cost.md"), "w").write("\n".join(md) + "\n")
 
     k = args.latex_shot or max(shots)
@@ -356,20 +360,21 @@ def write_outputs(rows, args, dname, precision):
            r"\begin{tabular}{@{}lcrrrrrr@{}}", r"\toprule",
            r" & & & \multicolumn{3}{c}{Adaptation (per task)} & \multicolumn{2}{c}{Query (per image)} \\",
            r"\cmidrule(lr){4-6}\cmidrule(lr){7-8}",
-           r"Model & Test-time grads & Params & GMACs & ms & MB & MMACs & ms \\", r"\midrule"]
+           r"Model & Test-time grads & Params & GFLOPs & ms & MB & MFLOPs & ms \\", r"\midrule"]
     for m in models:
         r = by.get((m, k))
         if r is None:
             continue
         tex.append(f"{r['label']} & {r['test_time_grads']} & {r['params'] / 1e3:.0f}k & "
-                   f"{sig(r['adapt_gmacs'])} & {sig(r['adapt_ms'])} & {sig(r['adapt_peak_mb'])} & "
-                   f"{sig(r['query_mmacs_per_img'])} & {sig(r['query_ms_per_img'])} \\\\")
+                   f"{sig(r['adapt_gflops'])} & {sig(r['adapt_ms'])} & {sig(r['adapt_peak_mb'])} & "
+                   f"{sig(r['query_mflops_per_img'])} & {sig(r['query_ms_per_img'])} \\\\")
     n_supp = by[(models[0], k)]["n_support"]
     tex += [r"\bottomrule", r"\end{tabular}",
             rf"\caption{{Test-time cost of one {args.n_way}-way {k}-shot task ({n_supp} support images) on "
             rf"{dname.replace('_', ' ')} ({precision}). Adaptation: support set to task state; query: "
-            rf"per image, measured on batches of {Q}. MACs of convolutions and matrix multiplications "
-            r"(including backward passes for test-time gradients); wall-clock: median over repeated "
+            rf"per image, measured on batches of {Q}. FLOPs of convolutions and matrix multiplications "
+            r"(one multiply-add = 2 FLOPs; including backward passes for test-time gradients); "
+            r"wall-clock: median over repeated "
             r"runs; MB: peak working memory above weights and inputs.}",
             r"\label{tab:cost}", r"\end{table}"]
     open(os.path.join(out, "cost.tex"), "w").write("\n".join(tex).replace("–", "--") + "\n")
