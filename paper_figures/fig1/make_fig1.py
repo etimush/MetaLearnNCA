@@ -2,8 +2,8 @@
 
 Usage (from the repository root):
   python paper_figures/fig1/run_loop.py 0 43 paper_figures/fig1/loop_s0.npz   # checkpoint seed, eval seed
-  python paper_figures/fig1/make_fig1.py paper_figures/fig1/loop_s0.npz paper_figures/fig1/fig1_loop [5,13,23]
-The optional last argument lists the program channels shown (default: 5,13,23).
+  python paper_figures/fig1/make_fig1.py paper_figures/fig1/loop_s0.npz paper_figures/fig1/fig1_loop [5,23]
+The optional last argument lists the program channels shown (default: 5,23).
 Writes <out>.pdf (vector, fonts embedded, for the paper) and <out>.png (preview).
 """
 import sys
@@ -16,7 +16,7 @@ from matplotlib.patches import FancyBboxPatch, Rectangle, FancyArrowPatch
 z = np.load(sys.argv[1])
 out = sys.argv[2]
 # program channels shown (default: the channels discussed in Section 6.6)
-CH = [int(c) for c in sys.argv[3].split(",")] if len(sys.argv) > 3 else [5, 13, 23]
+CH = [int(c) for c in sys.argv[3].split(",")] if len(sys.argv) > 3 else [5, 23]
 
 plt.rcParams.update({
     "font.family": "serif", "font.serif": ["Liberation Serif"], "mathtext.fontset": "stix",
@@ -121,7 +121,7 @@ ax.add_patch(FancyBboxPatch((SPLIT + 0.03, 0.03), W - SPLIT - 0.06, 1.03,
 ax.text(0.09, 2.37, r"(a) Support adaptation: $K$ rounds, no gradients", fontsize=7.4, fontweight="bold",
         ha="left", va="top")
 ax.text(0.09, 1.01, "(b) Query inference", fontsize=7.4, fontweight="bold", ha="left", va="top")
-ax.text(SPLIT + 0.09, 1.01, r"(c) Program channels over rounds $k$", fontsize=7.4, fontweight="bold",
+ax.text(SPLIT + 0.09, 1.01, r"(c) Adaptation over rounds $k$", fontsize=7.4, fontweight="bold",
         ha="left", va="top")
 
 # ---------------- (a) adaptation loop ----------------
@@ -227,16 +227,19 @@ label(bax_x + bax_w / 2, yB - 0.12, "class scores", fontsize=6.3)
 acc = z["acc"]
 ts, gap = 0.195, 0.085
 x0 = W - 0.10 - (6 * ts + 5 * gap)
-rows_y = [0.585, 0.37, 0.155]
-for c, yr in zip(CH, rows_y):
+ch_rows = [0.59, 0.375][:len(CH)]
+y_votes = 0.15
+for c, yr in zip(CH, ch_rows):
     ax.text(x0 - 0.07, yr + ts / 2, rf"$\mathbf{{S}}^{{(k)}}_{{{c}}}$", ha="right", va="center", fontsize=7)
-ax.text(x0 - 0.07, 0.093, "acc.", ha="right", va="center", fontsize=6.4)
+ax.text(x0 - 0.07, y_votes + ts / 2, "query\nvotes", ha="right", va="center", fontsize=6.2, linespacing=0.95)
+ax.text(x0 - 0.07, 0.080, "acc.", ha="right", va="center", fontsize=6.4)
 for k in range(6):
     xk = x0 + k * (ts + gap)
-    for c, yr in zip(CH, rows_y):
+    for c, yr in zip(CH, ch_rows):
         chan_card(xk, yr, S[k], c, ts, lw=0.4)
-    ax.text(xk + ts / 2, rows_y[0] + ts + 0.025, f"$k={k}$", ha="center", va="bottom", fontsize=6.5)
-    ax.text(xk + ts / 2, 0.093, f"{acc[k]:.0f}%", ha="center", va="center", fontsize=6.5)
+    card(xk, y_votes, votes_rgb(z["qlog_k"][k], z["qmask"][0, 0]), ts, lw=0.4)
+    ax.text(xk + ts / 2, ch_rows[0] + ts + 0.025, f"$k={k}$", ha="center", va="bottom", fontsize=6.5)
+    ax.text(xk + ts / 2, 0.080, f"{acc[k]:.0f}%", ha="center", va="center", fontsize=6.5)
 
 fig.savefig(out + ".pdf", dpi=600)   # dpi: resolution of the resampled 28x28 thumbnails
 fig.savefig(out + ".png", dpi=300)

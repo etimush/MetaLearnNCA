@@ -1,16 +1,18 @@
 """Run one released checkpoint on one 10-way 1-shot Omniglot task and save every intermediate
 tensor of the interaction loop (same math as ablation_lib.ProgramLearner.adapt / predict).
 
-Usage (from the repository root): python paper_figures/fig1/run_loop.py <ckpt seed> <eval seed> <out.npz>
+Usage (from the repository root):
+  python paper_figures/fig1/run_loop.py <ckpt seed> <eval seed> <out.npz> [dataset (default: omniglot)]
 """
 import sys, numpy as np, torch, torch.nn.functional as F
 sys.path.insert(0, "ablations")
 import ablation_lib as L
 
 seed_ckpt, eval_seed, out = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+dataset = sys.argv[4] if len(sys.argv) > 4 else "omniglot"
 learner = L.load_original_checkpoint(f"checkpoints/active_nca_seed{seed_ckpt}.pth",
                                      f"checkpoints/meta_nca_seed{seed_ckpt}.pth").eval()
-d = torch.load("data/ablation_cache/eval_omniglot.pt", weights_only=False)
+d = torch.load(f"data/ablation_cache/eval_{dataset}.pt", weights_only=False)
 imgs, tg = d["images"], torch.as_tensor(d["targets"])
 split = L.make_task_split(tg, 10, 1, eval_seed)
 sx, sy = imgs[split.supp_idx], torch.as_tensor(split.supp_y)
