@@ -12,6 +12,7 @@ of MetaLearnNCA; everything else is the training protocol of
 | `eval_ablation.py` | Evaluate every run on the Table-1 protocol and write the tables (Markdown, LaTeX, CSV) |
 | `eval_recurrence.py` | Test-time recurrence ablation and stability analysis on trained models (no retraining) |
 | `run_ablations.sh` | Train all variants × seeds (multi-GPU), then evaluate |
+| `test_time_cost.py` | Test-time cost table (R1, R3): MACs, wall-clock and peak memory of adaptation and of query inference for the baselines, MetaLearnNCA, NCA-ProtoNet and gradient-on-S |
 | `make_table1.py` | Multi-seed Table 1: combines `baseline_results/results_raw.csv` (from `Train-Canonical-Models.py --seeds ...`) with the MetaLearnNCA rows of `ablation_results/results_raw.csv`; mean ± SD over training seeds, and a win/loss/n.s. call against the best baseline per row |
 
 ## Variants
@@ -106,7 +107,23 @@ python ablations/make_table1.py --baseline_csv baseline_results/results_raw.csv 
 
 # 5. Test-time recurrence / stability (original checkpoints, no retraining)
 python ablations/eval_recurrence.py --original_ckpts checkpoints --original_seeds 0 1 6 --shot 10
+
+# 6. Test-time cost table (a few minutes on a GPU; no checkpoints or data needed)
+python ablations/test_time_cost.py
 ```
+
+`test_time_cost.py` measures, for 10-way 1/5/10-shot tasks, the **adaptation** stage (support set →
+task state: class means, 5 FOMAML inner steps, or K = 5 Active-/Meta-NCA rounds) and **query**
+inference per image. MACs are counted by `torch.utils.flop_counter` (convolutions and matrix
+multiplications, including backward passes for test-time gradients), wall-clock is the median of
+repeated synchronised runs, and peak memory is the GPU working memory above weights and inputs.
+Every model runs its evaluation code path; the baselines embed the support set once per task (a
+start-up check confirms this gives the same scores as their `forward()`). Cost does not depend on
+weights or image content, so random weights and images are used. The NCA uses the exact
+static-term precomputation of the evaluation (1.28 G MACs per query image);
+`--literal_nca` gives the cost of the original update form (2.04 G MACs, same outputs).
+Outputs: `cost_results/cost.csv`, `cost.md` (all shots, plus ratios to ProtoNet and FOMAML)
+and `cost.tex` (one shot, `--latex_shot`). `--query_batch 1` gives single-image latency.
 
 Outputs:
 * `ablation_runs/<variant>/seed<s>/`: `config.json`, `train_log.csv`, `status.json`, `model.pt`
